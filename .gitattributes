@@ -1,0 +1,8 @@
+# Shell scripts must keep LF wherever they are checked out: a CRLF shebang makes
+# Linux and macOS fail with "bad interpreter", and these are run on all three.
+vaadin-dev  text eol=lf
+mvnw        text eol=lf
+*.sh        text eol=lf
+
+# The Windows launcher wants CRLF.
+mvnw.cmd    text eol=crlf

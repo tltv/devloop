@@ -1,0 +1,378 @@
+package com.vaadin.devloop.daemon;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.security.SecureRandom;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * The dev-loop daemon: one per project root, discovered through
+ * {@code .vaadin/daemon.properties}, never started by hand.
+ * <p>
+ * P1 scope is lifecycle only - {@code status}, {@code start}, {@code stop},
+ * {@code restart}, {@code shutdown}. The transaction verbs come in P2/P3, which
+ * is why the wire protocol already streams progress lines before a final exit
+ * code: {@code apply} will need exactly that shape.
+ */
+public final class Daemon {
+
+    static final String MAIN_CLASS = "com.dev.vaadin.example.Application";
+    private static final String VERSION = "p3";
+
+    private static volatile int currentPort;
+    private static volatile String currentToken;
+
+    static int currentPort() {
+        return currentPort;
+    }
+
+    static String currentToken() {
+        return currentToken;
+    }
+
+    private final Path root;
+    private final AppProcess app;
+    private final Instant startedAt = Instant.now();
+    private final AtomicInteger liveClients = new AtomicInteger();
+    private volatile Instant lastActivity = Instant.now();
+    private volatile boolean shuttingDown;
+    private ServerSocket serverSocket;
+
+    private final Duration idleTimeout = Duration.ofSeconds(Long.getLong(
+            "vaadin.dev.idleSeconds", 1800L));
+
+    private final TransactionEngine transactions;
+
+    private Daemon(Path root) {
+        this.root = root;
+        Launch launch = new Launch(root, System.out::println);
+        this.app = new AppProcess(root, launch);
+        this.transactions = new TransactionEngine(root, launch, app);
+    }
+
+    public static void main(String[] args) throws Exception {
+        Path root = Path.of(args.length > 0 ? args[0] : ".").toAbsolutePath()
+                .normalize();
+        new Daemon(root).run();
+    }
+
+    private void run() throws IOException {
+        // Stale-instance takeover, decided by process liveness rather than by
+        // probing a socket. A live predecessor wins and we exit quietly.
+        Optional<Handshake> existing = Handshake.read(root);
+        if (existing.isPresent()) {
+            if (existing.get().isProcessAlive()) {
+                System.out.println("daemon already running on port "
+                        + existing.get().port + " (pid " + existing.get().pid
+                        + ")");
+                return;
+            }
+            System.out.println("reaping stale daemon record (pid "
+                    + existing.get().pid + " is gone)");
+            Handshake.delete(root);
+        }
+
+        serverSocket = new ServerSocket(0, 32, InetAddress.getLoopbackAddress());
+        currentPort = serverSocket.getLocalPort();
+        byte[] secret = new byte[24];
+        new SecureRandom().nextBytes(secret);
+        currentToken = Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(secret);
+
+        long pid = ProcessHandle.current().pid();
+        long start = ProcessHandle.current().info().startInstant()
+                .map(Instant::toEpochMilli).orElse(System.currentTimeMillis());
+        new Handshake(pid, start, currentPort, currentToken, root.toString())
+                .write(root);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(this::cleanup));
+        startIdleWatchdog();
+
+        System.out.println("vaadin-dev daemon " + VERSION + " listening on "
+                + currentPort + " for " + root);
+
+        while (!shuttingDown) {
+            try {
+                Socket client = serverSocket.accept();
+                Thread.ofVirtual().start(() -> handle(client));
+            } catch (IOException e) {
+                if (!shuttingDown) {
+                    System.err.println("accept failed: " + e);
+                }
+            }
+        }
+    }
+
+    private void startIdleWatchdog() {
+        ScheduledExecutorService scheduler = Executors
+                .newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "idle-watchdog");
+                    t.setDaemon(true);
+                    return t;
+                });
+        scheduler.scheduleAtFixedRate(() -> {
+            if (shuttingDown || liveClients.get() > 0 || !app.isIdle()) {
+                return;
+            }
+            if (Duration.between(lastActivity, Instant.now())
+                    .compareTo(idleTimeout) > 0) {
+                System.out.println("idle for " + idleTimeout.toSeconds()
+                        + "s with no app running - shutting down");
+                requestShutdown();
+            }
+        }, 5, 5, TimeUnit.SECONDS);
+    }
+
+    private void handle(Socket client) {
+        liveClients.incrementAndGet();
+        try (client;
+                BufferedReader in = new BufferedReader(new InputStreamReader(
+                        client.getInputStream(), StandardCharsets.UTF_8));
+                PrintWriter out = new PrintWriter(client.getOutputStream(), true,
+                        StandardCharsets.UTF_8)) {
+            String request = in.readLine();
+            if (request == null) {
+                return;
+            }
+            String[] parts = request.trim().split("\\s+");
+            if (parts.length < 2 || !tokenMatches(parts[0])) {
+                out.println("> unauthorized");
+                out.println("EXIT 77");
+                return;
+            }
+            lastActivity = Instant.now();
+            String verb = parts[1].toLowerCase();
+            List<String> rest = List.of(parts).subList(
+                    Math.min(2, parts.length), parts.length);
+
+            if (verb.equals("register")) {
+                handleRegistration(rest, in, out);
+                return;
+            }
+            dispatch(verb, rest, out);
+        } catch (IOException e) {
+            // Client vanished mid-command; nothing to report to.
+        } finally {
+            liveClients.decrementAndGet();
+            lastActivity = Instant.now();
+        }
+    }
+
+    /**
+     * The in-app connector's connection. It is held open for the app's lifetime,
+     * so its close is the signal that the app is gone - no polling, no probing.
+     */
+    private void handleRegistration(List<String> args, BufferedReader in,
+            PrintWriter out) throws IOException {
+        String mode = args.isEmpty() ? "unknown" : args.get(0);
+        Connector connector = new Connector(out);
+        app.onRegistered(mode);
+        transactions.onConnector(connector);
+        out.println("> registered");
+        // Issued off-thread: the reply is only readable once the pump below is
+        // running, so asking inline would wait for a line nobody is reading.
+        Thread.ofVirtual().start(() -> connector.command("INFO", 10)
+                .ifPresent(info -> System.out.println("app registered (mode="
+                        + mode + ") " + info)));
+        try {
+            // Block until the app closes the connection or dies, feeding replies
+            // to whoever issued a command.
+            Connector.pump(in, connector, () -> lastActivity = Instant.now());
+        } finally {
+            connector.close();
+            transactions.onConnector(null);
+            app.onUnregistered();
+            System.out.println("app registration closed");
+        }
+    }
+
+    private void dispatch(String verb, List<String> args, PrintWriter out) {
+        Launch.Log log = text -> {
+            out.println("> " + text);
+            out.flush();
+        };
+        try {
+            switch (verb) {
+            case "ping" -> {
+                log.line("pong " + VERSION + " pid "
+                        + ProcessHandle.current().pid());
+                out.println("EXIT 0");
+            }
+            case "status" -> {
+                boolean json = args.contains("--json");
+                (json ? statusJson() : statusText()).forEach(log::line);
+                out.println("EXIT 0");
+            }
+            case "redefine" -> {
+                // Diagnostic: pushes named classes at the running app and returns
+                // the connector's reply verbatim, with none of apply's escalation
+                // policy applied. This is what the measurement harnesses need -
+                // raw JVM behaviour - and it keeps them on the one transport
+                // instead of a second socket of their own.
+                if (args.isEmpty()) {
+                    log.line("usage: redefine <binary.Class,...>");
+                    out.println("EXIT 64");
+                } else {
+                    Connector connector = transactions.connector();
+                    if (connector == null || !connector.isOpen()) {
+                        log.line("no app registered");
+                        out.println("EXIT 1");
+                    } else {
+                        String reply = connector
+                                .command("REDEFINE " + args.get(0), 60)
+                                .orElse("ERR kind=no-reply");
+                        log.line(reply);
+                        out.println("EXIT " + (reply.startsWith("OK") ? 0 : 1));
+                    }
+                }
+            }
+            case "apply" -> {
+                boolean json = args.contains("--json");
+                // With --json the response must be parseable, so progress lines
+                // are dropped rather than interleaved with the object.
+                Launch.Log progress = json ? text -> {
+                } : log;
+                TransactionEngine.Transaction tx = transactions.apply(progress,
+                        !args.contains("--no-restart"));
+                if (json) {
+                    log.line(tx.json());
+                } else {
+                    transactions.render(tx).forEach(log::line);
+                }
+                out.println("EXIT " + tx.outcome.exitCode);
+            }
+            case "start" -> {
+                String result = app.start(log);
+                log.line(result);
+                out.println("EXIT " + (result.startsWith("failed") ? 1 : 0));
+            }
+            case "stop" -> {
+                log.line(app.stop());
+                out.println("EXIT 0");
+            }
+            case "restart" -> {
+                app.stop();
+                String result = app.start(log);
+                log.line(result);
+                out.println("EXIT " + (result.startsWith("failed") ? 1 : 0));
+            }
+            case "shutdown" -> {
+                log.line("daemon shutting down");
+                if (!app.isIdle()) {
+                    log.line("stopping app it owns");
+                    app.stop();
+                }
+                out.println("EXIT 0");
+                out.flush();
+                requestShutdown();
+            }
+            default -> {
+                log.line("unknown command: " + verb);
+                out.println("EXIT 64");
+            }
+            }
+        } catch (Exception e) {
+            log.line("error: " + e);
+            out.println("EXIT 70");
+        }
+    }
+
+    private List<String> statusText() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(app.state().name().toLowerCase());
+        app.pid().ifPresent(pid -> sb.append("  pid=").append(pid));
+        // Only a crash reports an exit code. After a deliberate stop the code is
+        // an artifact of how we terminated it, and "exit=1" reads as a failure.
+        if (app.state() == AppProcess.State.CRASHED) {
+            app.exitCode().ifPresent(code -> sb.append("  exit=").append(code));
+        }
+        if (app.state() == AppProcess.State.RUNNING) {
+            sb.append("  owner=daemon  registered=").append(app.isRegistered());
+        }
+        List<String> lines = new java.util.ArrayList<>();
+        lines.add(sb.toString());
+        app.failureReason().ifPresent(reason -> lines.add(reason));
+        frontendStatus().ifPresent(f -> lines.add("frontend " + f));
+        transactions.current().ifPresent(
+                tx -> lines.add("tx#" + tx.id + " in flight: " + tx.state));
+        transactions.lastTransaction()
+                .ifPresent(tx -> lines.add("last " + tx.summary()));
+        lines.add("daemon pid=" + ProcessHandle.current().pid() + " port="
+                + currentPort + " up="
+                + Duration.between(startedAt, Instant.now()).toSeconds() + "s");
+        return lines;
+    }
+
+    /** Asks the app for dev-server liveness; empty when no app is registered. */
+    private Optional<String> frontendStatus() {
+        Connector active = transactions.connector();
+        if (active == null || !active.isOpen()) {
+            return Optional.empty();
+        }
+        return active.command("FRONTEND", 5)
+                .map(reply -> Connector.fields(reply).getOrDefault("frontend",
+                        "unknown"));
+    }
+
+    private List<String> statusJson() {
+        String json = "{\"app\":{\"state\":\"" + app.state().name().toLowerCase()
+                + "\",\"pid\":" + app.pid().map(String::valueOf).orElse("null")
+                + ",\"exitCode\":"
+                + app.exitCode().map(String::valueOf).orElse("null")
+                + ",\"registered\":" + app.isRegistered() + ",\"owner\":\"daemon\""
+                + ",\"mode\":\"" + app.mode() + "\",\"frontend\":\""
+                + Json.escape(frontendStatus().orElse("unknown")) + "\"},\"daemon\":{\"pid\":"
+                + ProcessHandle.current().pid() + ",\"port\":" + currentPort
+                + ",\"version\":\"" + VERSION + "\",\"uptimeSeconds\":"
+                + Duration.between(startedAt, Instant.now()).toSeconds()
+                + "},\"transaction\":{\"inFlight\":"
+                + transactions.current()
+                        .map(tx -> "\"tx#" + tx.id + ":" + tx.state + "\"")
+                        .orElse("null")
+                + ",\"last\":"
+                + transactions.lastTransaction().map(TransactionEngine.Transaction::json)
+                        .orElse("null")
+                + "}}";
+        return List.of(json);
+    }
+
+    private boolean tokenMatches(String candidate) {
+        return java.security.MessageDigest.isEqual(
+                candidate.getBytes(StandardCharsets.UTF_8),
+                currentToken.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void requestShutdown() {
+        shuttingDown = true;
+        try {
+            serverSocket.close();
+        } catch (IOException ignored) {
+            // Closing is what unblocks accept(); failure here is not actionable.
+        }
+    }
+
+    private void cleanup() {
+        // Shutting down the daemon stops the app it owns, per the ownership model.
+        if (!app.isIdle()) {
+            app.stop();
+        }
+        Handshake.read(root)
+                .filter(h -> h.pid == ProcessHandle.current().pid())
+                .ifPresent(h -> Handshake.delete(root));
+    }
+}

@@ -1,86 +1,74 @@
-# My Application
+# Vaadin dev-loop daemon
 
-A Spring Boot + Vaadin project. Build your UI in pure Java — no HTML, no JavaScript.
+A long-running daemon that owns one Vaadin application's edit-to-running-app loop —
+background compilation, hot reload, browser refresh, error reporting — and answers,
+authoritatively, "what is the state of my last change?" Driven by a `vaadin-dev` CLI, so
+an agent or a developer gets the same answer with the same command.
 
-> **New to Vaadin?** The 5-minute [Quickstart](https://vaadin.com/quickstart) walks you from here to your first running app, a live code change, and an AI-assisted edit with Copilot.
+Design and evidence live in [devloop-daemon/PLAN.md](devloop-daemon/PLAN.md) and
+[devloop-daemon/PHASE0-FINDINGS.md](devloop-daemon/PHASE0-FINDINGS.md).
 
----
+## Modules
 
-## Fastest start — no plugin needed
+| Module | What it is |
+|---|---|
+| `flow-devloop` | The in-app connector: registers Flow's `Hotswapper`, redefines every loaded copy of a changed class, and holds the connection the daemon drives. No Spring dependency. |
+| `devloop-daemon` | The daemon — transactions, compile leg, app process, local RPC. JDK-only. |
+| `demo-app` | A Vaadin application, standing in for any user application, with the `vaadin-dev` CLI and the Maven wrapper. |
 
-From the project folder:
+`demo-app` is self-contained on purpose: the daemon serves one application using only that
+application's own wrapper and classpath, and knows nothing about this repository's layout.
 
-```bash
-./mvnw spring-boot:run        # Windows: mvnw.cmd spring-boot:run
-```
-
-No system Maven required — the wrapper is included. Then open **http://localhost:8080**.
-
-The first start takes ~30 seconds while Maven downloads dependencies. You'll get a runnable **Task List** app: a data grid (Description / Due Date / Creation Date), a Create button, and an empty-state message. When you see that, you're running.
-
-> **Port 8080 already in use?** Stop the other process, or set `server.port=8081` in `src/main/resources/application.properties` and open that port instead.
->
-> **To stop the app:** press `Ctrl+C` in the terminal (or the red Stop button if you launched from your IDE).
-
-## Optional upgrade — instant hotswap
-
-Running with `spring-boot:run` works, but Java code changes need a restart. For **live reload** — edit Java, see it in the browser without restarting — install the **Vaadin plugin** and start the app through it:
-
-- **IntelliJ IDEA:** install *Vaadin* from the JetBrains Marketplace → **Debug using Hotswap Agent** (dropdown next to Run). *Just installed it? Let IntelliJ finish indexing, or restart it, if the menu item isn't there yet.*
-- **VS Code:** install the *Vaadin* extension → **Vaadin: Debug using Hotswap Agent** from the command palette.
-- **Eclipse:** install the *Vaadin* plugin → right-click the project → **Run As → Vaadin Application**.
-
-This is what makes the edit-and-see-it loop feel instant — and it's required for the AI edits in [Vaadin Copilot](https://vaadin.com/docs/latest/tools/copilot).
-
----
-
-## Day 2: make your task list interactive (~10 min)
-
-Your app lists tasks. Let's make a row do something when you click it.
-
-**1. Add a click listener (by hand).** In `src/main/java/com/example/examplefeature/ui/TaskListView.java`, add this after the `taskGrid.addColumn(...)` block:
-
-```java
-taskGrid.addItemClickListener(event ->
-    Notification.show("Due: " + Optional.ofNullable(event.getItem().getDueDate())
-        .map(LocalDate::toString)
-        .orElse("no due date")));
-```
-
-Add the import: `import com.vaadin.flow.component.notification.Notification;`
-
-Save and click a task — a notification shows its due date. That's a server-side event handler, in pure Java.
-
-**2. Let Copilot finish it.** Open Copilot (bottom-right toolbar → **Edit mode**), click the AI assistant, and try:
-
-> When a task row is clicked, open a dialog showing its description, due date, and creation date, with a Close button.
-
-Copilot writes the dialog into `TaskListView.java` for you. Open the file — your new code is right there.
-
----
-
-## Ask your AI assistant about Vaadin (optional)
-
-If you use Claude Code, Cursor, or another AI coding assistant, connect it to the **Vaadin MCP server** so it answers against real Vaadin docs and the exact API of your installed version — instead of guessing from outdated training data.
+## Using it
 
 ```bash
-# One-time setup — see https://vaadin.com/docs/latest/building-apps/mcp
+cd demo-app
+./mvnw -f ../pom.xml -DskipTests install   # all modules; needs network for the frontend build
+./vaadin-dev start                         # daemon auto-spawns and launches the app
+# edit some Java or CSS, then:
+./vaadin-dev apply                         # blocks until Stable or Failed; exit code is the outcome
+./vaadin-dev status --json
+./vaadin-dev shutdown
 ```
 
-A `.mcp.json` is included (commented out by default). Uncomment it, or run the setup command above, to activate.
+Run Maven from `demo-app` so the wrapper finds its own `.mvn`; `-f ../pom.xml` builds the
+whole reactor, and plain `./mvnw` builds the app alone once `flow-devloop` is installed.
 
----
+`vaadin-dev --help` lists the rest. The daemon starts itself on first use, one per
+application, and on first run stages its jars into `.vaadin/` — building them from the
+sibling `devloop-daemon` module if it is present. Point `VAADIN_DEV_HOME` at a directory
+containing `devloop-daemon.jar` to use a prebuilt one instead, which is what a shipped
+version would provision the way HotswapAgent already is. The java agent is not shipped at
+all: the script carries its single class and compiles it on demand.
 
-## Build for production
+Useful knobs, passed through `VAADIN_DEV_DAEMON_OPTS`:
 
 ```bash
-./mvnw package
-java -jar target/*.jar
+# run a real Vite dev server instead of building a bundle (any vaadin.* property
+# is forwarded to the app JVM)
+VAADIN_DEV_DAEMON_OPTS="-Dvaadin.frontend.hotdeploy=true" ./vaadin-dev start
+# pin the app's JVM, e.g. to compare stock HotSpot against JBR
+VAADIN_DEV_DAEMON_OPTS="-Dvaadin.dev.javaHome=$HOME/.jdks/openjdk-25.0.2" ./vaadin-dev start
 ```
 
-## Learn more
+## Where things end up
 
-- [Vaadin Quickstart](https://vaadin.com/quickstart) — the 5-minute getting-started path
-- [Components](https://vaadin.com/docs/latest/components) — 50+ UI components, all callable from Java
-- [Vaadin Copilot](https://vaadin.com/docs/latest/tools/copilot) — visual + AI editing in the browser
-- [Full documentation](https://vaadin.com/docs)
+Everything is under the application, because that is the only tree the daemon assumes:
+
+- `demo-app/.vaadin/` — handshake file (port + token), the provisioned HotswapAgent jar, and
+  the daemon's own jars
+- `demo-app/target/devloop/` — daemon log, app log, classpath cache, harness results
+
+## Measurement harnesses
+
+Run from `demo-app`; they drive the daemon's `redefine` verb, which reports raw JVM
+behaviour without `apply`'s escalation policy:
+
+```bash
+cd demo-app
+java ../devloop-daemon/harness/DevLoopHarness.java --label jdk25   # escalation rate
+java ../devloop-daemon/harness/P05Harness.java --test spring       # framework coverage
+```
+
+Note they deliberately bypass the escalation rules, so they can leave the app in a state
+`apply` would have refused — that is the point of them.

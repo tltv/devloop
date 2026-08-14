@@ -1,4 +1,4 @@
-/target/
+target/
 .idea/
 .vscode/
 .settings
@@ -7,6 +7,9 @@
 
 *.iml
 .DS_Store
+
+# Dev-loop daemon runtime state: handshake file and provisioned agents
+.vaadin/
 
 # The following files are generated/updated by vaadin-maven-plugin
 node_modules/

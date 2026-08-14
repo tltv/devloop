@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dev.vaadin.example</groupId>
+        <artifactId>dev-vaadin-example-root</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>flow-devloop</artifactId>
+    <name>Flow dev-loop connector</name>
+    <description>
+        In-app half of the dev-loop daemon: registers Flow's Hotswapper, performs the
+        atomic redefine over every loaded copy of a class, and holds the registration
+        connection the daemon drives.
+    </description>
+
+    <dependencies>
+        <!-- The hotswap SPI (com.vaadin.base.devserver.hotswap) lives here as of
+             25.1; before that it was in flow-server. Provided: the app already has
+             it in dev mode, and this must never be dragged into a production build. -->
+        <dependency>
+            <groupId>com.vaadin</groupId>
+            <artifactId>vaadin-dev-server</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.vaadin</groupId>
+            <artifactId>flow-server</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <!-- @Priority, which orders this hotswapper after Flow's own. -->
+        <dependency>
+            <groupId>jakarta.annotation</groupId>
+            <artifactId>jakarta.annotation-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Not used directly, but VaadinSession implements
+             HttpSessionBindingListener, so it must be on the compile classpath. -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dev.vaadin.example</groupId>
+        <artifactId>dev-vaadin-example-root</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>devloop-daemon</artifactId>
+    <name>Dev-loop daemon</name>
+    <description>
+        Long-running daemon that owns one app's development loop: transactions, the
+        compile leg, the app process, and the local RPC the vaadin-dev CLI speaks.
+        JDK-only by design - it must start fast and never drag the app's classpath in.
+
+        The java agent that publishes the app JVM's Instrumentation handle is not built
+        here: it is a single dependency-free class carried in, and compiled on demand by,
+        the vaadin-dev script, so there is one copy of it rather than two to keep in step.
+    </description>
+
+    <properties>
+        <!-- Stable names so the CLI can reference the jars without a version. -->
+        <daemon.jar.name>devloop-daemon</daemon.jar.name>
+    </properties>
+
+    <build>
+        <finalName>${daemon.jar.name}</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <!-- The daemon: a runnable program. -->
+                    <execution>
+                        <id>default-jar</id>
+                        <goals>
+                            <goal>jar</goal>
+                        </goals>
+                        <configuration>
+                            <archive>
+                                <manifest>
+                                    <mainClass>com.vaadin.devloop.daemon.Daemon</mainClass>
+                                </manifest>
+                            </archive>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

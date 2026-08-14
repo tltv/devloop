@@ -1,24 +1,35 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
-    <!-- Project from https://start.vaadin.com/4bba109c-ddaf-4404-bf70-922062167a85 -->
+
+    <!-- A pure root: no parent of its own. It aggregates the three modules and is
+         the parent of the two dev-loop ones. demo-app deliberately does not inherit
+         from here - it stands in for an arbitrary user application, so it carries
+         its own Spring Boot parent and its own configuration, exactly as a real
+         application would. -->
     <groupId>com.dev.vaadin.example</groupId>
-    <artifactId>dev-vaadin-example</artifactId>
+    <artifactId>dev-vaadin-example-root</artifactId>
     <version>1.0-SNAPSHOT</version>
-    <packaging>jar</packaging>
-    
+    <packaging>pom</packaging>
+    <name>Vaadin dev-loop</name>
+
     <properties>
-        <java.version>25</java.version>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <vaadin.version>25.2.6</vaadin.version>
+        <jakarta.annotation.version>3.0.0</jakarta.annotation.version>
+        <jakarta.servlet.version>6.1.0</jakarta.servlet.version>
     </properties>
-    
-    <parent>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-parent</artifactId>
-        <version>4.1.0</version>
-        <relativePath/>
-    </parent>
-    
+
+    <!-- demo-app is aggregated but not inherited from; Maven treats aggregation and
+         inheritance separately, so one command still builds everything. Order
+         matters: demo-app resolves flow-devloop. -->
+    <modules>
+        <module>flow-devloop</module>
+        <module>devloop-daemon</module>
+        <module>demo-app</module>
+    </modules>
+
     <dependencyManagement>
         <dependencies>
             <dependency>
@@ -28,70 +39,38 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <dependency>
+                <groupId>jakarta.annotation</groupId>
+                <artifactId>jakarta.annotation-api</artifactId>
+                <version>${jakarta.annotation.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>jakarta.servlet</groupId>
+                <artifactId>jakarta.servlet-api</artifactId>
+                <version>${jakarta.servlet.version}</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
-    
-    <dependencies>
-        <dependency>
-            <groupId>com.vaadin</groupId>
-            <!-- Replace artifactId with vaadin-core to use only free components -->
-            <artifactId>vaadin</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.vaadin</groupId>
-            <artifactId>vaadin-dev</artifactId>
-            <optional>true</optional>
-        </dependency>
-        <dependency>
-            <groupId>com.vaadin</groupId>
-            <artifactId>vaadin-spring-boot-starter</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.vaadin</groupId>
-            <artifactId>hilla-spring-boot-starter</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-jpa</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.h2database</groupId>
-            <artifactId>h2</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>com.vaadin</groupId>
-            <artifactId>browserless-test-spring</artifactId>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-    
+
     <build>
-        <defaultGoal>spring-boot:run</defaultGoal>
-        <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-            </plugin>
-            <plugin>
-                <groupId>com.vaadin</groupId>
-                <artifactId>vaadin-maven-plugin</artifactId>
-                <version>${vaadin.version}</version>
-                <executions>
-                    <execution>
-                        <goals>
-                            <goal>build-frontend</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
-        </plugins>
+        <pluginManagement>
+            <!-- Pinned rather than left to Maven's defaults, so a build is
+                 reproducible and works from a warm local repository. -->
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.15.0</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-jar-plugin</artifactId>
+                    <version>3.5.1</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
     </build>
-    
+
     <repositories>
         <repository>
             <id>central</id>
@@ -105,15 +84,4 @@
             <url>https://maven.vaadin.com/vaadin-addons</url>
         </repository>
     </repositories>
-    
-    <pluginRepositories>
-        <!-- Central first to avoid unnecessary lookups from maven.vaadin.com for all artifacts -->
-        <pluginRepository>
-            <id>central</id>
-            <url>https://repo.maven.apache.org/maven2</url>
-            <snapshots>
-                <enabled>false</enabled>
-            </snapshots>
-        </pluginRepository>
-    </pluginRepositories>
 </project>
