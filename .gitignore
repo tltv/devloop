@@ -11,7 +11,16 @@ target/
 # Dev-loop daemon runtime state: handshake file and provisioned agents
 .vaadin/
 
-# The following files are generated/updated by vaadin-maven-plugin
+# The following files are generated/updated by vaadin-maven-plugin. Patterns holding a
+# slash are anchored to this directory, so the ones below carry **/ to match inside
+# demo-app - or any future module - and not only at the repository root.
 node_modules/
-src/main/frontend/generated/
+**/src/main/frontend/generated/
 vite.generated.ts
+
+# Vaadin generates the app shell when it is missing. Force-add it (git add -f) if you
+# start customising it for real.
+**/src/main/frontend/index.html
+
+# Playwright MCP session output: console logs, snapshots, screenshots
+.playwright-mcp/
