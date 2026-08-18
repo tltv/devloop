@@ -27,6 +27,9 @@ import java.util.Optional;
  */
 final class Launch {
 
+    static final boolean WINDOWS = System.getProperty("os.name", "")
+            .toLowerCase(Locale.ROOT).startsWith("windows");
+
     /** Pinned, never "latest": a changing agent would make applies irreproducible. */
     static final String HA_VERSION = "2.0.1";
     static final String HA_SHA256 = "ba8d5e0571dc7952f2455f09d9ef6ca96782c17bc3d12f61eb3a5760f2a897f1";
@@ -200,19 +203,24 @@ final class Launch {
             Files.createDirectories(cache.getParent());
             // The application's own wrapper. The daemon works against one app and
             // uses only that app's build, so it looks no further than the app dir.
-            String mvnw = Files.isRegularFile(root.resolve("mvnw.cmd"))
-                    ? root.resolve("mvnw.cmd").toString()
-                    : root.resolve("mvnw").toString();
+            // Chosen by platform, not by which file happens to exist: a project
+            // generated on Windows ships both wrappers, and mvnw.cmd is a batch
+            // file that a Linux or macOS shell cannot run.
+            String mvnw = mavenWrapper().toString();
             Process process = new ProcessBuilder(mvnw, "-q", "-o",
                     "dependency:build-classpath",
                     "-Dmdep.outputFile=" + cache).directory(root.toFile())
                             .redirectErrorStream(true).start();
+            String output;
             try (InputStream in = process.getInputStream()) {
-                in.readAllBytes();
+                output = new String(in.readAllBytes());
             }
             try {
                 if (process.waitFor() != 0) {
-                    throw new IOException("classpath resolution failed");
+                    // The wrapper's own words: without them a failure here is a
+                    // dead end, and this is the first build the daemon ever runs.
+                    throw new IOException("classpath resolution failed ("
+                            + mvnw + "): " + lastLines(output, 10));
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -221,6 +229,17 @@ final class Launch {
         }
         return Files.readString(cache).trim() + java.io.File.pathSeparator
                 + root.resolve("target").resolve("classes");
+    }
+
+    /** The Maven wrapper for this platform, inside the application. */
+    private Path mavenWrapper() {
+        return root.resolve(WINDOWS ? "mvnw.cmd" : "mvnw");
+    }
+
+    private static String lastLines(String output, int count) {
+        List<String> lines = output.strip().lines().toList();
+        return String.join(" | ",
+                lines.subList(Math.max(0, lines.size() - count), lines.size()));
     }
 
     /** The full command line, in the order a human would want to read it. */
