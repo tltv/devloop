@@ -417,11 +417,25 @@ final class TransactionEngine {
         // shape, because the proxy was generated against the old one. HA's Spring
         // plugin could fix that, but it is disabled for stability (see Launch),
         // so these escalate.
-        String beans = fields.getOrDefault("beans", "-");
         String structural = fields.getOrDefault("structural", "-");
-        if (!"-".equals(beans) && !"-".equals(structural)) {
+        if ("-".equals(structural)) {
+            return Optional.empty();
+        }
+        String beans = fields.getOrDefault("beans", "-");
+        if (!"-".equals(beans)) {
             return Optional.of("structural change to a Spring bean (" + beans
                     + "): the existing proxy would not match the new class");
+        }
+        // The same failure without an annotation to spot it by. A Spring Data
+        // repository is a bare interface, so the annotation check above says
+        // nothing about it - and a method added to it lands on a proxy generated
+        // from the old interface, whose queries were derived at startup. This is
+        // the case that reported Stable for a repository the app can no longer
+        // even start with, so the live proxy, not the annotation, is the signal.
+        String proxied = fields.getOrDefault("proxied", "-");
+        if (!"-".equals(proxied)) {
+            return Optional.of("structural change to a proxied type (" + proxied
+                    + "): the live proxy was generated from the old shape");
         }
         return Optional.empty();
     }

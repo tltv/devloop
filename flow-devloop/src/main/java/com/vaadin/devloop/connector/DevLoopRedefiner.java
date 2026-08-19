@@ -65,10 +65,15 @@ final class DevLoopRedefiner {
                 .get(System.getProperty("devloop.classes", "target/classes"));
 
         Map<String, List<Class<?>>> loaded = new HashMap<>();
+        // Collected in the same pass, because the one walk over every loaded
+        // class is the expensive part and a proxy is never a requested class.
+        List<Class<?>> proxies = new ArrayList<>();
         for (Class<?> candidate : inst.getAllLoadedClasses()) {
             if (requested.contains(candidate.getName())) {
                 loaded.computeIfAbsent(candidate.getName(),
                         key -> new ArrayList<>()).add(candidate);
+            } else if (isProxy(candidate)) {
+                proxies.add(candidate);
             }
         }
 
@@ -135,11 +140,18 @@ final class DevLoopRedefiner {
         long redefineMs = (System.nanoTime() - redefineStart) / 1_000_000;
 
         Set<String> structural = new LinkedHashSet<>();
+        Set<String> proxied = new LinkedHashSet<>();
         for (ClassDefinition definition : definitions) {
             Class<?> type = definition.getDefinitionClass();
             String previous = before.get(type.getName());
             if (previous != null && !previous.equals(members(type))) {
                 structural.add(simple(type.getName()));
+            }
+            for (Class<?> proxy : proxies) {
+                if (type.isAssignableFrom(proxy)) {
+                    proxied.add(simple(type.getName()));
+                    break;
+                }
             }
         }
 
@@ -153,9 +165,10 @@ final class DevLoopRedefiner {
         return "OK redefined=" + definitions.size() + " notLoaded="
                 + notLoaded.size() + " dupes=" + duplicates + " completed="
                 + completed + " pageReload=" + pageReload + " entities="
-                + join(entities) + " beans=" + join(beans) + " structural="
-                + join(structural) + " hotswapAgent=" + hotswapAgentLoaded()
-                + " redefineMs=" + redefineMs + " hotswapMs=" + hotswapMs;
+                + join(entities) + " beans=" + join(beans) + " proxied="
+                + join(proxied) + " structural=" + join(structural)
+                + " hotswapAgent=" + hotswapAgentLoaded() + " redefineMs="
+                + redefineMs + " hotswapMs=" + hotswapMs;
     }
 
     /**
@@ -344,6 +357,31 @@ final class DevLoopRedefiner {
         return hasAnnotation(type, "jakarta.persistence.Entity",
                 "jakarta.persistence.MappedSuperclass",
                 "jakarta.persistence.Embeddable");
+    }
+
+    /**
+     * Whether this loaded class is a proxy generated over some other type.
+     * <p>
+     * This is the check that catches what {@link #isSpringBean} cannot: not
+     * every Spring-managed type carries an annotation. A Spring Data repository
+     * is a bare interface registered by {@code @EnableJpaRepositories}, and its
+     * live bean is a JDK proxy built from that interface's members as they were
+     * when the context started. Adding a method to the interface therefore adds
+     * it to nothing that runs - and for a repository the method never even
+     * becomes a query, since derivation happened at startup too. Asking Spring
+     * would need Spring on the classpath; the generated proxy is evidence enough
+     * and is already loaded in this JVM.
+     */
+    private static boolean isProxy(Class<?> type) {
+        if (java.lang.reflect.Proxy.isProxyClass(type)) {
+            return true;
+        }
+        // Subclass proxies, which is what Spring generates for a class-based
+        // bean - @Transactional and friends.
+        String name = type.getName();
+        return name.contains("$$SpringCGLIB$$")
+                || name.contains("$$EnhancerBySpringCGLIB$$")
+                || name.contains("$$EnhancerByCGLIB$$");
     }
 
     private static boolean isSpringBean(Class<?> type) {

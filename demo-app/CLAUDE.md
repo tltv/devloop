@@ -56,7 +56,7 @@ compiling → Failed
 |---|---|
 | CSS/icons under `META-INF/resources/` | updates in place, **no reload** |
 | Java method bodies, string literals, most view code | updates in place, **no reload** |
-| Structural Java (new fields/beans, changed routes or annotations) | restart → **reload the page** |
+| Structural Java (new fields/beans, new repository methods, changed routes or annotations) | restart → **reload the page** |
 | `application.properties` | copied only — run `./vaadin-dev restart` to take effect |
 | Hand-written `src/main/frontend/` files | not watched; start with `VAADIN_DEV_DAEMON_OPTS="-Dvaadin.frontend.hotdeploy=true" ./vaadin-dev start` |
 
