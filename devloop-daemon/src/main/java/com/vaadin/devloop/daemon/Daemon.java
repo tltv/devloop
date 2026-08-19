@@ -308,6 +308,18 @@ public final class Daemon {
         lines.add(sb.toString());
         app.failureReason().ifPresent(reason -> lines.add(reason));
         frontendStatus().ifPresent(f -> lines.add("frontend " + f));
+        // Errors the app has logged since the last apply. This is where a failure
+        // that only shows up when someone uses the app surfaces: an apply cannot
+        // wait for the next page render, but the question "is my change alright?"
+        // is asked again here, and by then the app has answered it.
+        List<String> logErrors = appLogErrors();
+        if (!logErrors.isEmpty()) {
+            lines.add("app log: " + logErrors.size() + " error(s)"
+                    + transactions.lastTransaction()
+                            .map(tx -> " since tx#" + tx.id)
+                            .orElse(" since the app started"));
+            lines.add("  " + logErrors.get(0).strip());
+        }
         transactions.current().ifPresent(
                 tx -> lines.add("tx#" + tx.id + " in flight: " + tx.state));
         transactions.lastTransaction()
@@ -316,6 +328,14 @@ public final class Daemon {
                 + currentPort + " up="
                 + Duration.between(startedAt, Instant.now()).toSeconds() + "s");
         return lines;
+    }
+
+    /**
+     * What the app has logged as an error since the last apply marked the log.
+     * Empty before the first launch, and after an app that has been quiet.
+     */
+    private List<String> appLogErrors() {
+        return app.watch().map(AppLog.Watch::errors).orElse(List.of());
     }
 
     /** Asks the app for dev-server liveness; empty when no app is registered. */
@@ -343,7 +363,9 @@ public final class Daemon {
                         .orElse("null")
                 + ",\"registered\":" + app.isRegistered() + ",\"owner\":\"daemon\""
                 + ",\"mode\":\"" + app.mode() + "\",\"frontend\":\""
-                + Json.escape(frontendStatus().orElse("unknown")) + "\"},\"daemon\":{\"pid\":"
+                + Json.escape(frontendStatus().orElse("unknown"))
+                + "\",\"logErrors\":" + Json.strings(appLogErrors())
+                + "},\"daemon\":{\"pid\":"
                 + ProcessHandle.current().pid() + ",\"port\":" + currentPort
                 + ",\"version\":\"" + VERSION + "\",\"uptimeSeconds\":"
                 + Duration.between(startedAt, Instant.now()).toSeconds()

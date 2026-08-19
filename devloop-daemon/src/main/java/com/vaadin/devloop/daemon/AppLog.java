@@ -58,6 +58,41 @@ final class AppLog {
                     + "|Exception encountered during context initialization"
                     + "|\\b(ERROR|SEVERE|FATAL)\\b");
 
+    /**
+     * One logged error. The level field of a log line, plus the header a stack
+     * trace gets when it reaches stderr with no logger at all. Frames are not
+     * matched: they carry no message, and the line above them does.
+     */
+    private static final Pattern ERROR_LINE = Pattern
+            .compile("\\b(ERROR|SEVERE|FATAL)\\b|^Exception in thread ");
+
+    /**
+     * The line that opens a stack trace - the exception's own type and message.
+     * A logger prints its message first and the throwable on the line below, so
+     * this is where the type is, and the type is what says whether a redefine
+     * held. Anchored, so a frame mentioning a class never passes for one.
+     */
+    private static final Pattern THROWN_HEADER = Pattern
+            .compile("^(Caused by: )?[\\w.$]*(Exception|Error)(:|$)");
+
+    /**
+     * Errors that mean a redefine did not hold. Deliberately narrow: an app is
+     * free to log an error of its own during a request, and turning that into a
+     * failed apply would make the verdict worse, not better. These are the ones
+     * that only happen when running code and loaded classes disagree - a call
+     * landing on a proxy or a caller compiled against a member that is no longer
+     * there - plus the bean failures a re-created context throws. Anything else
+     * is reported and left to the developer to judge.
+     */
+    private static final Pattern RELOAD_FAILURE = Pattern.compile(
+            "AbstractMethodError|NoSuchMethodError|NoSuchFieldError"
+                    + "|IncompatibleClassChangeError|LinkageError"
+                    + "|NoClassDefFoundError|BeanCreationException"
+                    + "|BeanInstantiationException|UnsatisfiedDependencyException");
+
+    /** Errors kept per window; a reply quoting more than this helps nobody. */
+    private static final int MAX_ERRORS = 5;
+
     private AppLog() {
     }
 
@@ -122,6 +157,136 @@ final class AppLog {
             return lines;
         }
     }
+
+    /**
+     * Follows a running app's log for the errors nothing else can see. The
+     * compiler answers for the source and the redefine answers for the bytes;
+     * neither answers for a Spring context that failed to re-create a bean or a
+     * call that landed on a stale proxy. Those exist only as lines in the app's
+     * log, so an apply that never reads it can report {@code Stable} on an app
+     * that is loudly broken.
+     * <p>
+     * On demand rather than on a thread: the file is the buffer, and a cursor
+     * reads only what appeared since the last look, so a drain at apply time and
+     * a drain at {@code status} time between them miss nothing.
+     */
+    static final class Watch {
+
+        /** How long a drain keeps waiting for more after each new line. */
+        private static final long QUIET_MILLIS = 100L;
+
+        private final Cursor cursor;
+        private final List<String> errors = new ArrayList<>();
+        private int count;
+        private String failure;
+        private boolean continuing;
+
+        Watch(Path log) {
+            this.cursor = new Cursor(log);
+        }
+
+        /** New lines since the last look, errors among them recorded. */
+        synchronized List<String> drain() {
+            List<String> lines = cursor.drain();
+            for (String line : lines) {
+                boolean header = THROWN_HEADER.matcher(line).find();
+                boolean logged = ERROR_LINE.matcher(line).find();
+                if (logged) {
+                    count++;
+                    continuing = errors.size() < MAX_ERRORS;
+                    if (continuing) {
+                        errors.add(line);
+                    }
+                } else if (continuing && header) {
+                    // The throwable the line above was about. Kept with it rather
+                    // than counted again: one failure, reported as one error, and
+                    // the half of it that names the type is this half.
+                    int last = errors.size() - 1;
+                    errors.set(last, errors.get(last) + " | " + line.strip());
+                    continuing = false;
+                } else {
+                    continuing = false;
+                }
+                // Classified on the header too, not only on the logged line: a
+                // linkage error's type never appears on the line carrying the
+                // level, and Spring's real reason is in a "Caused by:" further
+                // down still. Frames cannot match, so this stays narrow.
+                if (failure == null && (logged || header)
+                        && RELOAD_FAILURE.matcher(line).find()) {
+                    failure = line.strip();
+                }
+            }
+            return lines;
+        }
+
+        /**
+         * The error in this window that means the change is not live, if any. The
+         * apply that provoked it should escalate to a restart rather than report
+         * {@code Stable}: a restart is the ground truth, and it either clears the
+         * error or fails with the app's own words.
+         */
+        synchronized Optional<String> failure() {
+            drain();
+            return Optional.ofNullable(failure);
+        }
+
+        /**
+         * Starts a fresh window. Whatever the log already holds belongs to what
+         * came before, so it is read past and dropped rather than blamed on the
+         * change about to be made.
+         */
+        synchronized void mark() {
+            drain();
+            errors.clear();
+            count = 0;
+            failure = null;
+            continuing = false;
+        }
+
+        /**
+         * The errors in this window, following the log for {@code millis} first.
+         * Logging is asynchronous to the redefine that provoked it, so a drain
+         * that returns the instant the connector replies can read an empty log and
+         * call a broken app stable.
+         * <p>
+         * The whole window, with no early exit on a quiet poll: the errors worth
+         * catching are logged by whichever thread the change reached - a UI thread
+         * refreshing, a context re-creating a bean - and not by the one that
+         * answered the redefine, so "the log went quiet for 100 ms" is no evidence
+         * that it is finished. A fixed window is also a fixed cost, which is what
+         * makes it something to tune rather than something to wonder about.
+         */
+        synchronized List<String> settle(long millis) {
+            long deadline = System.nanoTime() + millis * 1_000_000L;
+            while (true) {
+                drain();
+                long remaining = (deadline - System.nanoTime()) / 1_000_000L;
+                if (remaining <= 0) {
+                    break;
+                }
+                try {
+                    Thread.sleep(Math.min(QUIET_MILLIS, remaining));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            return List.copyOf(errors);
+        }
+
+        /** The errors in this window, without waiting for more. */
+        synchronized List<String> errors() {
+            drain();
+            return List.copyOf(errors);
+        }
+
+        /** How many there were, including the ones not kept. */
+        synchronized int count() {
+            drain();
+            return count;
+        }
+    }
+
 
     /** The last lines of the log, blank ones dropped, oldest first. */
     static List<String> tail(Path log) {

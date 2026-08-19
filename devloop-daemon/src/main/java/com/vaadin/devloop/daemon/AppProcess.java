@@ -80,6 +80,7 @@ final class AppProcess {
     private volatile boolean registered;
     private volatile String failureReason;
     private volatile Path logFile;
+    private volatile AppLog.Watch watch;
     private final AtomicBoolean stopExpected = new AtomicBoolean();
     private volatile CountDownLatch registrationLatch = new CountDownLatch(1);
 
@@ -112,6 +113,15 @@ final class AppProcess {
 
     Optional<String> failureReason() {
         return Optional.ofNullable(failureReason);
+    }
+
+    /**
+     * The log watch for the current app, empty before the first launch. Held here
+     * because it belongs to the process: a restart gets a truncated log and a new
+     * watch to read it with.
+     */
+    Optional<AppLog.Watch> watch() {
+        return Optional.ofNullable(watch);
     }
 
     /**
@@ -167,8 +177,11 @@ final class AppProcess {
 
         started.onExit().thenAccept(this::handleExit);
 
-        // Redirect.to truncates, so this run's output starts at offset zero.
-        AppLog.Cursor cursor = new AppLog.Cursor(appLog);
+        // Redirect.to truncates, so this run's output starts at offset zero. The
+        // watch outlives the start: the errors a change provokes are logged long
+        // after the app came up, and this is the only reader of that log.
+        AppLog.Watch watching = new AppLog.Watch(appLog);
+        this.watch = watching;
         CountDownLatch latch = registrationLatch;
         long registerBy = System.nanoTime() + STARTUP_TIMEOUT.toNanos();
         long settleBy = 0;
@@ -176,7 +189,8 @@ final class AppProcess {
         boolean serving = false;
 
         while (true) {
-            serving = serving || cursor.drain().stream().anyMatch(AppLog::serving);
+            serving = serving
+                    || watching.drain().stream().anyMatch(AppLog::serving);
             if (up && (serving || System.nanoTime() >= settleBy)) {
                 state = State.RUNNING;
                 return Startup.ok(serving ? "running"

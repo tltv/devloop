@@ -47,10 +47,18 @@ compiling → runtime → restarting → Stable                     ← app rest
 compiling → Failed
   Foo.java:51:53  error: cannot find method bar() in class Foo
   → check the name, or add the missing member/import          ← fix, re-apply; app keeps last good bytes
+app log: 1 error(s) since the change; see target/devloop/app.log
+  ERROR ... : There was an exception while trying to navigate  ← the change is live and the app threw
 ```
 
+An `app log:` line means the app logged an error while the change went live — the bytes are
+live, the code did something wrong. `Stable` with this line under it is not a green result:
+read the error before reporting the change as working. `status` shows the same for errors
+logged since the last apply, which is where a failure that only appears when someone uses
+the app turns up.
+
 `--json` gives `outcome`, `classification`, `changeSet`, `diagnostics[]`
-(`file`/`line`/`column`/`message`/`hint`), `timings`, `nextAction`.
+(`file`/`line`/`column`/`message`/`hint`), `logErrors[]`, `timings`, `nextAction`.
 
 | Edit | Browser |
 |---|---|

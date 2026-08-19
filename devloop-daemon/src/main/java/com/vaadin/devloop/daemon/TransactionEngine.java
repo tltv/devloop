@@ -72,6 +72,8 @@ final class TransactionEngine {
         volatile String escalation = "";
         volatile int resources;
         volatile String frontend = "";
+        /** What the app logged while this change was going live. */
+        volatile List<String> logErrors = List.of();
         long detectMs;
         long compileMs;
         long runtimeMs;
@@ -96,7 +98,8 @@ final class TransactionEngine {
                             : "\"" + Json.escape(escalation) + "\"")
                     + ",\"duplicateClassCopies\":" + duplicates
                     + ",\"resources\":" + resources + ",\"frontend\":\""
-                    + Json.escape(frontend) + "\""
+                    + Json.escape(frontend) + "\",\"logErrors\":"
+                    + Json.strings(logErrors)
                     + ",\"timings\":{\"detectMs\":" + detectMs
                     + ",\"compileMs\":" + compileMs + ",\"runtimeMs\":"
                     + runtimeMs + ",\"totalMs\":" + totalMs
@@ -108,6 +111,16 @@ final class TransactionEngine {
                     + (reason.isEmpty() ? "" : " (" + reason + ")");
         }
     }
+
+    /**
+     * How long an apply follows the app's log after a redefine the JVM accepted.
+     * Logging is asynchronous to the call that caused it, so returning the instant
+     * the connector replies can read an empty log and call a broken app stable.
+     * Long enough for a stack trace on another thread to land, short enough to
+     * stay well under the compile it is added to; {@code 0} turns it off.
+     */
+    private static final long ERROR_SETTLE_MILLIS = Long
+            .getLong("vaadin.dev.errorSettleMillis", 400L);
 
     private final Compile compile;
     private final Launch launch;
@@ -165,6 +178,10 @@ final class TransactionEngine {
             changes.deleted().forEach(
                     path -> tx.changeSet.add(compile.relative(path) + " (deleted)"));
             staleResources.forEach(path -> tx.changeSet.add(compile.relative(path)));
+
+            // From here on, whatever the app logs belongs to this change. Read
+            // past what is already there rather than blaming it on this apply.
+            app.watch().ifPresent(AppLog.Watch::mark);
 
             // The resource leg. Runs first because a Java change may also need
             // fresh resources on the classpath, and it is the whole transaction
@@ -259,6 +276,10 @@ final class TransactionEngine {
                     tx.duplicates = parseInt(fields.get("dupes"));
                     if ("OK".equals(fields.get("status"))) {
                         Optional<String> blocker = blockedReason(fields);
+                        if (blocker.isEmpty()) {
+                            // What the JVM accepted, the app still has to run.
+                            blocker = loggedFailure(tx, log);
+                        }
                         if (blocker.isEmpty()) {
                             tx.hotswapDetail = "redefineClasses("
                                     + fields.getOrDefault("redefined", "0")
@@ -364,6 +385,9 @@ final class TransactionEngine {
                 : "true".equals(resourceFields.get("browserReload"))
                         ? "browser reload requested"
                         : "no browser connected";
+        // Reported, not waited for: CSS is the fastest leg there is and pushing a
+        // stylesheet cannot break a class, so this leg spends no time settling.
+        app.watch().ifPresent(watching -> tx.logErrors = watching.errors());
         return finish(tx, Outcome.STABLE, "", "hmr", "", started);
     }
 
@@ -399,6 +423,37 @@ final class TransactionEngine {
 
     Connector connector() {
         return connector;
+    }
+
+    /**
+     * What the app logged while the change was going live, and whether any of it
+     * means the change is not. The redefine is reported by the JVM and the
+     * compile by javac; this is the only leg with an opinion about the app
+     * actually running - a context that failed to re-create a bean, a call that
+     * landed on a stale proxy - and it is the leg that was missing.
+     * <p>
+     * Every error is recorded on the transaction, but only the ones that cannot
+     * be anything else escalate: an app is free to log an error of its own, and
+     * a restart on account of one would be a worse answer than the truth.
+     */
+    private Optional<String> loggedFailure(Transaction tx, Launch.Log log) {
+        AppLog.Watch watching = app.watch().orElse(null);
+        if (watching == null) {
+            return Optional.empty();
+        }
+        List<String> errors = watching.settle(ERROR_SETTLE_MILLIS);
+        tx.logErrors = errors;
+        if (!errors.isEmpty()) {
+            log.line("app log: " + errors.size() + " error(s) since the redefine");
+        }
+        return watching.failure().map(line -> "the app logged " + brief(line));
+    }
+
+    /** Enough of a log line to recognise it by, where there is room for one. */
+    private static String brief(String line) {
+        String trimmed = line.strip();
+        return trimmed.length() <= 160 ? trimmed
+                : trimmed.substring(0, 157) + "...";
     }
 
     /**
@@ -520,6 +575,15 @@ final class TransactionEngine {
                 lines.add("restart: " + tx.escalation);
             }
         }
+        }
+        // Errors the app logged while this change went live. Not a verdict - the
+        // ones that are a verdict escalated already and are named in the reason -
+        // but never swallowed either: an apply that says Stable over a stack trace
+        // is how a green result stops being worth anything.
+        if (!tx.logErrors.isEmpty() && tx.outcome != Outcome.FAILED) {
+            lines.add("app log: " + tx.logErrors.size()
+                    + " error(s) since the change; see target/devloop/app.log");
+            lines.add("  " + brief(tx.logErrors.get(0)));
         }
         return lines;
     }

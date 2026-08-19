@@ -49,6 +49,8 @@ Useful knobs, passed through `VAADIN_DEV_DAEMON_OPTS`:
 VAADIN_DEV_DAEMON_OPTS="-Dvaadin.frontend.hotdeploy=true" ./vaadin-dev start
 # pin the app's JVM, e.g. to compare stock HotSpot against JBR
 VAADIN_DEV_DAEMON_OPTS="-Dvaadin.dev.javaHome=$HOME/.jdks/openjdk-25.0.2" ./vaadin-dev start
+# how long an apply follows the app's log for errors the redefine provoked (0 turns it off)
+VAADIN_DEV_DAEMON_OPTS="-Dvaadin.dev.errorSettleMillis=800" ./vaadin-dev start
 ```
 
 ## Where things end up
