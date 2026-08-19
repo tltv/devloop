@@ -3,6 +3,8 @@ package com.vaadin.devloop.daemon;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
@@ -27,6 +29,43 @@ final class AppProcess {
         STOPPED, STARTING, RUNNING, CRASHED
     }
 
+    /** How long an app may take to register before a start gives up on it. */
+    private static final Duration STARTUP_TIMEOUT = Duration.ofMinutes(5);
+
+    /**
+     * How long the app has to prove it survived registering, used only when it
+     * never reports a listening web server. See {@link #start}.
+     */
+    private static final Duration SETTLE = Duration
+            .ofMillis(Long.getLong("vaadin.dev.startSettleMillis", 2500L));
+
+    private static final long POLL_MILLIS = 100L;
+
+    /**
+     * A start's verdict. Callers need the answer itself, not a message to match
+     * on: "exit code is the outcome" only holds if the code is derived from the
+     * same fact the caller sees.
+     */
+    record Startup(boolean ok, String message, List<String> detail) {
+
+        static Startup ok(String message) {
+            return new Startup(true, message, List.of());
+        }
+
+        /**
+         * The verdict first, then whatever evidence there is. The message is the
+         * bare reason so that a caller which has its own framing - a
+         * transaction's {@code restart: ...} - does not end up saying "failed"
+         * twice.
+         */
+        List<String> lines() {
+            List<String> lines = new ArrayList<>();
+            lines.add(ok ? message : "failed: " + message);
+            lines.addAll(detail);
+            return lines;
+        }
+    }
+
     private final Path root;
     private final Launch launch;
 
@@ -36,6 +75,7 @@ final class AppProcess {
     private volatile String mode = "unknown";
     private volatile boolean registered;
     private volatile String failureReason;
+    private volatile Path logFile;
     private final AtomicBoolean stopExpected = new AtomicBoolean();
     private volatile CountDownLatch registrationLatch = new CountDownLatch(1);
 
@@ -71,23 +111,36 @@ final class AppProcess {
     }
 
     /**
-     * Launches and waits for the app to register. The wait is gated on the real
-     * signal - registration, or the process dying - never on a timer, so an app
-     * that starts in 3 s returns in 3 s and one that fails returns immediately.
+     * Launches and waits until the app is serving or gone, because a start that
+     * reports success for an app that is already dying is worse than no answer.
+     * Two gates, neither of them a timer:
+     * <ol>
+     * <li><b>Registered</b> - the in-app connector called home, so the app's own
+     * code is running.</li>
+     * <li><b>Serving</b> - registration happens while the Spring context is
+     * still refreshing and the embedded web server binds its port <em>after</em>
+     * that, so an app whose port is taken registers happily and only then dies.
+     * The second gate is the app reporting its server listening, with surviving a
+     * short settle as the fallback for a stack that logs no such line.</li>
+     * </ol>
+     * Either gate losing the race to the process exiting is a failure, reported
+     * with the reason from the app's own log instead of a bare exit code.
      */
-    synchronized String start(Launch.Log log) throws IOException {
+    synchronized Startup start(Launch.Log log) throws IOException {
         if (state == State.RUNNING || state == State.STARTING) {
-            return "already running";
+            return Startup.ok(state == State.STARTING ? "already starting"
+                    : "already running");
         }
         List<String> command = launch.command(Daemon.currentPort(),
                 Daemon.currentToken(), Daemon.MAIN_CLASS);
-        Path logFile = Launch.workDir(root).resolve("app.log");
-        Files.createDirectories(logFile.getParent());
+        Path appLog = Launch.workDir(root).resolve("app.log");
+        Files.createDirectories(appLog.getParent());
 
         stopExpected.set(false);
         registered = false;
         failureReason = null;
         exitCode = null;
+        logFile = appLog;
         registrationLatch = new CountDownLatch(1);
         state = State.STARTING;
 
@@ -103,41 +156,55 @@ final class AppProcess {
 
         Process started = new ProcessBuilder(command).directory(root.toFile())
                 .redirectErrorStream(true)
-                .redirectOutput(ProcessBuilder.Redirect.to(logFile.toFile()))
+                .redirectOutput(ProcessBuilder.Redirect.to(appLog.toFile()))
                 .start();
         this.process = started;
-        log.line("app pid " + started.pid() + ", log " + logFile);
+        log.line("app pid " + started.pid() + ", log " + appLog);
 
         started.onExit().thenAccept(this::handleExit);
 
-        // Race the registration against the process dying.
+        // Redirect.to truncates, so this run's output starts at offset zero.
+        AppLog.Cursor cursor = new AppLog.Cursor(appLog);
         CountDownLatch latch = registrationLatch;
+        long registerBy = System.nanoTime() + STARTUP_TIMEOUT.toNanos();
+        long settleBy = 0;
         boolean up = false;
-        long deadlineNanos = System.nanoTime() + TimeUnit.MINUTES.toNanos(5);
-        try {
-            while (System.nanoTime() < deadlineNanos) {
-                if (latch.await(200, TimeUnit.MILLISECONDS)) {
-                    up = true;
-                    break;
-                }
-                if (!started.isAlive()) {
-                    break;
-                }
+        boolean serving = false;
+
+        while (true) {
+            serving = serving || cursor.drain().stream().anyMatch(AppLog::serving);
+            if (up && (serving || System.nanoTime() >= settleBy)) {
+                state = State.RUNNING;
+                return Startup.ok(serving ? "running"
+                        : "running (registered; the app logged no server port)");
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return "failed: interrupted while waiting for the app to register";
+            if (!started.isAlive()) {
+                // The authoritative signal, and the only one carrying a code.
+                return failed("app exited with code " + started.exitValue()
+                        + (up ? " right after registering, before it was serving"
+                                : " before registering"), appLog);
+            }
+            if (!up && System.nanoTime() >= registerBy) {
+                return failed("app did not register within "
+                        + STARTUP_TIMEOUT.toMinutes() + " minutes", appLog);
+            }
+            try {
+                // The latch also fires when the process exits, so registration is
+                // decided by the flag the connector sets, not by the wake-up.
+                if (up) {
+                    Thread.sleep(POLL_MILLIS);
+                } else if (latch.await(POLL_MILLIS, TimeUnit.MILLISECONDS)
+                        && registered) {
+                    up = true;
+                    settleBy = System.nanoTime() + SETTLE.toNanos();
+                    log.line("registered; waiting for the web server to bind");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return failed("interrupted while waiting for the app to start",
+                        appLog);
+            }
         }
-        if (up) {
-            state = State.RUNNING;
-            return "running";
-        }
-        if (!started.isAlive()) {
-            return "failed: app exited with code " + exitCode
-                    + " before registering (see " + logFile + ")";
-        }
-        return "failed: app did not register within 5 minutes (see " + logFile
-                + ")";
     }
 
     synchronized String stop() {
@@ -160,6 +227,30 @@ final class AppProcess {
         return "stopped";
     }
 
+    /**
+     * Turns a dead or unreachable app into an answer that stands on its own. The
+     * app's log holds the only copy of the real reason - "Port 8080 was already
+     * in use" is printed by the app, nothing here can observe it - so the cause
+     * goes into the message and the tail comes along as the evidence.
+     */
+    private Startup failed(String message, Path appLog) {
+        String cause = AppLog.cause(appLog).orElse("");
+        String full = message + (cause.isEmpty() ? "" : ": " + cause);
+        // A crash has already recorded its own reason from the same log; this one
+        // only fills the gap where the app is alive but never registered.
+        if (failureReason == null) {
+            failureReason = full;
+        }
+        List<String> tail = AppLog.tail(appLog);
+        if (tail.isEmpty()) {
+            return new Startup(false, full, List.of("no output in " + appLog));
+        }
+        List<String> detail = new ArrayList<>();
+        detail.add("--- last " + tail.size() + " lines of " + appLog + " ---");
+        detail.addAll(tail);
+        return new Startup(false, full, detail);
+    }
+
     private void handleExit(Process exited) {
         exitCode = exited.exitValue();
         registered = false;
@@ -167,7 +258,13 @@ final class AppProcess {
             state = State.STOPPED;
         } else {
             state = State.CRASHED;
-            failureReason = "app exited unexpectedly with code " + exitCode;
+            Path appLog = logFile;
+            // The reason, not just the code: an "exit=1" whose cause stays buried
+            // in a log file is what made a port clash look like a tool bug.
+            failureReason = "app exited unexpectedly with code " + exitCode
+                    + (appLog == null ? ""
+                            : AppLog.cause(appLog).map(c -> ": " + c).orElse("")
+                                    + " (see " + appLog + ")");
         }
         // Release anyone waiting on startup so a failed launch returns at once.
         registrationLatch.countDown();

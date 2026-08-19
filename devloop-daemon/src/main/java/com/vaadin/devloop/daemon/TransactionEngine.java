@@ -297,17 +297,20 @@ final class TransactionEngine {
             log.line("restarting");
             long runtimeStart = System.nanoTime();
             app.stop();
-            String startResult;
+            AppProcess.Startup startup;
             try {
-                startResult = app.start(log);
+                startup = app.start(log);
             } catch (java.io.IOException e) {
                 tx.runtimeMs = (System.nanoTime() - runtimeStart) / 1_000_000;
                 return finish(tx, Outcome.FAILED, "restart: " + e.getMessage(),
                         "restart", "check target/devloop/app.log", started);
             }
             tx.runtimeMs = (System.nanoTime() - runtimeStart) / 1_000_000;
-            if (startResult.startsWith("failed")) {
-                return finish(tx, Outcome.FAILED, "restart: " + startResult,
+            if (!startup.ok()) {
+                // The tail goes to whoever is watching; the reason already names
+                // the cause, so --json stays a single parseable object.
+                startup.detail().forEach(log::line);
+                return finish(tx, Outcome.FAILED, "restart: " + startup.message(),
                         "restart", "check target/devloop/app.log", started);
             }
             return finish(tx, Outcome.STABLE, "", "restart", "", started);
@@ -470,8 +473,10 @@ final class TransactionEngine {
             // failure sends the reader looking in the wrong place.
             String phase = "hmr".equals(tx.classification) ? "frontend"
                     : tx.escalation.isEmpty() ? "compiling" : "runtime";
-            lines.add(phase + " → Failed" + (tx.diagnostics.isEmpty()
-                    ? "  (" + tx.reason + ")" : ""));
+            // The reason gets its own line below, so keeping it out of the header
+            // is what stops a long one - a restart failure quotes the app's own
+            // words - from being printed twice.
+            lines.add(phase + " → Failed");
             tx.diagnostics.forEach(message -> {
                 lines.add(message.terse());
                 message.hint().ifPresent(hint -> lines.add("  → " + hint));

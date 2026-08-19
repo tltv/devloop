@@ -20,7 +20,7 @@ survives between commands, so every command answers for the same running app.
 | Command | What it does |
 |---|---|
 | `./vaadin-dev status [--json]` | app up? registered? dev server? last transaction |
-| `./vaadin-dev start` | launch the app in dev mode (~30 s cold) |
+| `./vaadin-dev start` | launch the app in dev mode (~30 s cold); blocks until it serves or fails |
 | `./vaadin-dev apply [--json]` | make the edits on disk live; blocks until Stable or Failed |
 | `./vaadin-dev restart` | stop + start (needed after config changes) |
 | `./vaadin-dev stop` / `shutdown` | stop the app / stop the daemon too |
@@ -79,7 +79,9 @@ App URL: **http://localhost:8080** (unless `server.port` says otherwise).
 
 - `compiling → Failed` — diagnostics name file, line, column. Fix and re-apply.
 - `frontend-down` — Vite stopped answering: `./vaadin-dev restart`.
-- App crashed → `target/devloop/app.log`. Daemon wedged → `./vaadin-dev shutdown`, then any
+- App failed to start (a taken port, a bad config) → `start` exits `1` and names the reason
+  from the app's own log, with the tail printed under it; `status` repeats the reason. The
+  whole log is `target/devloop/app.log`. Daemon wedged → `./vaadin-dev shutdown`, then any
   command respawns it.
 
 ## Also

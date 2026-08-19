@@ -257,9 +257,9 @@ public final class Daemon {
                 out.println("EXIT " + tx.outcome.exitCode);
             }
             case "start" -> {
-                String result = app.start(log);
-                log.line(result);
-                out.println("EXIT " + (result.startsWith("failed") ? 1 : 0));
+                AppProcess.Startup startup = app.start(log);
+                startup.lines().forEach(log::line);
+                out.println("EXIT " + (startup.ok() ? 0 : 1));
             }
             case "stop" -> {
                 log.line(app.stop());
@@ -267,9 +267,9 @@ public final class Daemon {
             }
             case "restart" -> {
                 app.stop();
-                String result = app.start(log);
-                log.line(result);
-                out.println("EXIT " + (result.startsWith("failed") ? 1 : 0));
+                AppProcess.Startup startup = app.start(log);
+                startup.lines().forEach(log::line);
+                out.println("EXIT " + (startup.ok() ? 0 : 1));
             }
             case "shutdown" -> {
                 log.line("daemon shutting down");
@@ -334,6 +334,13 @@ public final class Daemon {
                 + "\",\"pid\":" + app.pid().map(String::valueOf).orElse("null")
                 + ",\"exitCode\":"
                 + app.exitCode().map(String::valueOf).orElse("null")
+                // The reason belongs in the machine-readable answer too: an agent
+                // reading only JSON should not have to open app.log to learn that
+                // the port was taken.
+                + ",\"failureReason\":"
+                + app.failureReason()
+                        .map(reason -> "\"" + Json.escape(reason) + "\"")
+                        .orElse("null")
                 + ",\"registered\":" + app.isRegistered() + ",\"owner\":\"daemon\""
                 + ",\"mode\":\"" + app.mode() + "\",\"frontend\":\""
                 + Json.escape(frontendStatus().orElse("unknown")) + "\"},\"daemon\":{\"pid\":"

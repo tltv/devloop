@@ -32,7 +32,9 @@ usage: vaadin-dev <command> [options]
   status [--json]   app up? owner? dev server? current/last transaction
   apply [--json]    commit pending edits; blocks until Stable or Failed
                     (--no-restart to stop after the compile gate)
-  start             launch the app in dev mode (daemon owns it)
+  start             launch the app in dev mode (daemon owns it); blocks until
+                    the app is serving or has failed, and a failure names the
+                    reason and prints the tail of app.log
   stop              stop the app
   restart           stop then start
   shutdown          stop the daemon (and the app it owns)
@@ -47,7 +49,10 @@ The daemon starts automatically on first use and serves this application only.
   VAADIN_DEV_HOME          where the daemon's jars live (default: ./.vaadin)
   VAADIN_DEV_DAEMON_OPTS   JVM options for the daemon, e.g.
                            -Dvaadin.frontend.hotdeploy=true (any vaadin.* property
-                           is forwarded on to the app) or -Dvaadin.dev.idleSeconds=60
+                           is forwarded on to the app), -Dvaadin.dev.idleSeconds=60
+                           or -Dvaadin.dev.startSettleMillis=2500 (how long start
+                           waits for a registered app to prove it stays up, when
+                           the app logs no server port)
 EOF
 }
 
@@ -205,7 +210,10 @@ spawn_daemon() {
         sleep 0.1
         (( waited++ ))
     done
-    echo "vaadin-dev: daemon did not come up; see $DAEMON_LOG" >&2
+    # Same rule as the app: the reason exists only in the log the process wrote,
+    # so it comes back with the failure instead of being left there to be found.
+    echo "vaadin-dev: daemon did not come up; last lines of $DAEMON_LOG:" >&2
+    tail -n 15 "$DAEMON_LOG" 2>/dev/null | sed 's/^/  /' >&2
     return 70
 }
 
