@@ -33,11 +33,15 @@ final class AppProcess {
     private static final Duration STARTUP_TIMEOUT = Duration.ofMinutes(5);
 
     /**
-     * How long the app has to prove it survived registering, used only when it
-     * never reports a listening web server. See {@link #start}.
+     * How long a registered app has to report a listening web server before the
+     * start settles for "registered and still alive". A start returns the moment
+     * that line appears, so this bound is only ever reached by a stack that logs
+     * no such line - measured on this app, the bind lands several seconds after
+     * registration, and a window shorter than the gap would wave a port clash
+     * through as a success. See {@link #start}.
      */
     private static final Duration SETTLE = Duration
-            .ofMillis(Long.getLong("vaadin.dev.startSettleMillis", 2500L));
+            .ofMillis(Long.getLong("vaadin.dev.startSettleMillis", 15_000L));
 
     private static final long POLL_MILLIS = 100L;
 

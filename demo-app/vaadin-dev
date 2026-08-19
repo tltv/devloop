@@ -47,12 +47,14 @@ usage: vaadin-dev <command> [options]
 The daemon starts automatically on first use and serves this application only.
 
   VAADIN_DEV_HOME          where the daemon's jars live (default: ./.vaadin)
+  VAADIN_DEV_PROGRESS      auto (default: a moving phase line on stderr when it is
+                           a terminal), never, or always
   VAADIN_DEV_DAEMON_OPTS   JVM options for the daemon, e.g.
                            -Dvaadin.frontend.hotdeploy=true (any vaadin.* property
                            is forwarded on to the app), -Dvaadin.dev.idleSeconds=60
-                           or -Dvaadin.dev.startSettleMillis=2500 (how long start
-                           waits for a registered app to prove it stays up, when
-                           the app logs no server port)
+                           or -Dvaadin.dev.startSettleMillis=15000 (how long a
+                           registered app is given to report a listening web
+                           server; only reached if it never logs one)
 EOF
 }
 
@@ -203,19 +205,91 @@ spawn_daemon() {
 
     # Wait for the handshake file rather than sleeping a fixed amount.
     local waited=0
+    spin_begin "starting daemon"
     while (( waited < 200 )); do
         if [[ -f "$HANDSHAKE" ]] && read_prop port >/dev/null; then
+            spin_erase
             return 0
         fi
         sleep 0.1
+        # Every other pass: 0.1 s is a faster flicker than a spinner wants.
+        (( waited % 2 == 0 )) && spin_tick
         (( waited++ ))
     done
+    spin_erase
     # Same rule as the app: the reason exists only in the log the process wrote,
     # so it comes back with the failure instead of being left there to be found.
     echo "vaadin-dev: daemon did not come up; last lines of $DAEMON_LOG:" >&2
     tail -n 15 "$DAEMON_LOG" 2>/dev/null | sed 's/^/  /' >&2
     return 70
 }
+
+# A start or an apply goes quiet for tens of seconds while a JVM boots or javac
+# runs, and a silent terminal is indistinguishable from a wedged one. So: one
+# repainted line carrying the phase the daemon last reported and how long this
+# command has been running. No percentage - nothing here knows one, and a made-up
+# bar would be a claim the tool cannot back.
+#
+# Drawn on stderr, and only for a human: stdout stays exactly the lines the daemon
+# sent, so `status --json`, a pipe and an agent all see what they saw before.
+# VAADIN_DEV_PROGRESS=never turns it off, always forces it on (for a pty-less test).
+SPIN_FRAMES='|/-\'
+spin_i=0 spin_label='' spin_since=0 spin_quiet=0 spin_drawn=0 spin_cols=80
+
+spin_on() {
+    case "${VAADIN_DEV_PROGRESS:-auto}" in
+        never)  return 1 ;;
+        always) return 0 ;;
+        *)      [[ -t 2 ]] ;;
+    esac
+}
+
+spin_begin() { # $1=label
+    spin_label="$1"
+    spin_since=$SECONDS
+    spin_quiet=$SECONDS
+    spin_i=0
+    # Width resolved once per command, not per frame: COLUMNS is unset in a
+    # script, and one tput next to a JVM boot costs nothing.
+    if spin_on; then
+        spin_cols="${COLUMNS:-0}"
+        (( spin_cols > 0 )) || spin_cols="$(tput cols 2>/dev/null || echo 80)"
+    fi
+}
+
+# Wiped by overwriting with spaces rather than an erase escape: this runs in every
+# terminal the three platforms offer, including the ones that show \033[K raw.
+spin_erase() {
+    if spin_on && (( spin_drawn > 0 )); then
+        printf '\r%*s\r' "$spin_drawn" '' >&2
+        spin_drawn=0
+    fi
+}
+
+spin_tick() {
+    spin_on || return 0
+    local frame="${SPIN_FRAMES:$spin_i:1}"
+    spin_i=$(( (spin_i + 1) % ${#SPIN_FRAMES} ))
+    # The frames turn on a local timer, which says nothing about the daemon still
+    # working - so when it has gone quiet, say so instead of implying progress.
+    local quiet=$(( SECONDS - spin_quiet )) note='' text
+    if (( quiet > 20 )); then
+        note="  (quiet ${quiet}s)"
+    fi
+    # Sized to the window: a label that wraps to a second row would leave the
+    # first one behind on the next repaint.
+    local room=$(( spin_cols - 20 ))
+    (( room < 20 )) && room=20
+    printf -v text '%s %.*s  %ds%s' "$frame" "$room" "$spin_label" \
+        $(( SECONDS - spin_since )) "$note"
+    printf '\r%*s\r%s' "$spin_drawn" '' "$text" >&2
+    spin_drawn=${#text}
+}
+
+# A command that ends - normally or on Ctrl-C - must not leave a half-drawn frame
+# as the last thing in the scrollback.
+trap spin_erase EXIT
+trap 'spin_erase; exit 130' INT
 
 # Sends one command and streams the reply. Response lines are "> text" progress
 # followed by a final "EXIT <code>" which becomes this script's exit status.
@@ -227,15 +301,39 @@ send() { # $1=port $2=token $3...=command words
         return 99
     fi
     printf '%s %s\n' "$token" "$*" >&3
-    local line status=1
-    while IFS= read -r line <&3; do
+    local line status=1 buf='' chunk rc
+    spin_begin "$*"
+    while :; do
+        # A timeout is what makes room for a frame between two replies. Anything
+        # read before it fires is kept: bash leaves a partial line in the variable,
+        # and dropping it would silently truncate the reply.
+        IFS= read -r -t 0.2 chunk <&3
+        rc=$?
+        if (( rc > 128 )); then
+            buf+="$chunk"
+            spin_tick
+            continue
+        fi
+        line="$buf$chunk"
+        buf=''
         line="${line%$'\r'}"
+        # Erase first: a reply line must never be printed onto a drawn frame.
+        spin_erase
+        if (( rc != 0 )); then
+            # End of stream. Whatever arrived unterminated is still a reply.
+            [[ -n "$line" ]] && printf '%s\n' "$line"
+            break
+        fi
         case "$line" in
             "EXIT "*) status="${line#EXIT }"; break ;;
-            "> "*)    printf '%s\n' "${line#> }" ;;
+            # The last thing the daemon said is the truest label available: it
+            # names the phase, so the frame moves under "restarting", not "start".
+            "> "*)    printf '%s\n' "${line#> }"; spin_label="${line#> }" ;;
             *)        printf '%s\n' "$line" ;;
         esac
+        spin_quiet=$SECONDS
     done
+    spin_erase
     exec 3<&- 2>/dev/null || true
     return "$status"
 }
