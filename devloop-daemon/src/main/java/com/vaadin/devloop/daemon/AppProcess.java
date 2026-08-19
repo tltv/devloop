@@ -235,7 +235,7 @@ final class AppProcess {
      * Turns a dead or unreachable app into an answer that stands on its own. The
      * app's log holds the only copy of the real reason - "Port 8080 was already
      * in use" is printed by the app, nothing here can observe it - so the cause
-     * goes into the message and the tail comes along as the evidence.
+     * goes into the message and an excerpt comes along as the evidence.
      */
     private Startup failed(String message, Path appLog) {
         String cause = AppLog.cause(appLog).orElse("");
@@ -245,13 +245,16 @@ final class AppProcess {
         if (failureReason == null) {
             failureReason = full;
         }
-        List<String> tail = AppLog.tail(appLog);
-        if (tail.isEmpty()) {
+        // The report's own lines, not the log's last ones: a Spring failure ends
+        // in frames, so a plain tail shows the trace of the reason and never the
+        // reason itself.
+        List<String> excerpt = AppLog.excerpt(appLog);
+        if (excerpt.isEmpty()) {
             return new Startup(false, full, List.of("no output in " + appLog));
         }
         List<String> detail = new ArrayList<>();
-        detail.add("--- last " + tail.size() + " lines of " + appLog + " ---");
-        detail.addAll(tail);
+        detail.add("--- " + excerpt.size() + " lines from " + appLog + " ---");
+        detail.addAll(excerpt);
         return new Startup(false, full, detail);
     }
 
