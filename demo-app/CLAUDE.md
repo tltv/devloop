@@ -91,7 +91,7 @@ the app turns up.
 | `application.properties` | copied only — run `./vaadin-dev restart` to take effect |
 | Hand-written `src/main/frontend/` files | not watched; start with `VAADIN_DEV_DAEMON_OPTS="-Dvaadin.frontend.hotdeploy=true" ./vaadin-dev start` |
 | Java or CSS in a library module (`../demo-shared/`) | same as this module's — `changeSet` shows it as `../demo-shared/...` |
-| A `pom.xml` anywhere in the reactor | the next `apply` re-resolves through Maven (a few seconds), then **recompiles whole** every module whose compile classpath moved — so removing a dependency the code still uses `Failed`s with real diagnostics instead of breaking at runtime. If the **app's** classpath moved (a dependency added or removed) it also **restarts** and names what moved. A pom edit that changes neither stays `no changes` |
+| A `pom.xml` anywhere in the reactor | the next `apply` re-resolves through Maven (a few seconds), then **recompiles whole** every module whose compile classpath moved — so removing a dependency the code still uses `Failed`s with real diagnostics instead of breaking at runtime. If the **app's** classpath moved (a dependency added or removed) it also **restarts** and names what moved. A pom edit that changes neither stays `no changes`. A pom that does not resolve fails the apply and names the artifact |
 
 ## Verifying with Playwright
 

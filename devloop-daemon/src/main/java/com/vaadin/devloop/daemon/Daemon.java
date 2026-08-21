@@ -51,7 +51,6 @@ public final class Daemon {
     }
 
     private final Path root;
-    private final Reactor reactor;
     private final Launch launch;
     private final AppProcess app;
     private final Instant startedAt = Instant.now();
@@ -67,8 +66,8 @@ public final class Daemon {
 
     private Daemon(Path root) {
         this.root = root;
-        this.reactor = Reactor.discover(root, System.out::println);
-        this.launch = new Launch(reactor, System.out::println);
+        this.launch = new Launch(Reactor.discover(root, System.out::println),
+                System.out::println);
         this.app = new AppProcess(root, launch);
         this.transactions = new TransactionEngine(launch, app);
     }
@@ -116,9 +115,9 @@ public final class Daemon {
         // The loop's shape, said out loud. Which modules an apply watches is the
         // one thing a developer cannot infer from behaviour until an edit fails
         // to be noticed, and by then they are debugging the wrong thing.
-        if (reactor.isMultiModule()) {
-            System.out.println("reactor " + reactor.root() + " - "
-                    + reactor.describe());
+        if (launch.reactor().isMultiModule()) {
+            System.out.println("reactor " + launch.reactor().root() + " - "
+                    + launch.reactor().describe());
         }
 
         while (!shuttingDown) {
@@ -356,12 +355,12 @@ public final class Daemon {
      * single-module project says nothing, because there is nothing to say.
      */
     private Optional<String> modulesLine() {
-        if (!reactor.isMultiModule()) {
+        if (!launch.reactor().isMultiModule()) {
             return Optional.empty();
         }
         Optional<Launch.Project> resolved = launch.resolved();
         if (resolved.isEmpty()) {
-            return Optional.of("reactor " + reactor.describe()
+            return Optional.of("reactor " + launch.reactor().describe()
                     + "; the edit loop is resolved on the first apply or start");
         }
         List<String> loop = moduleNames(resolved.get().modules());
@@ -379,7 +378,7 @@ public final class Daemon {
     }
 
     private List<String> excludedModules(List<String> loop) {
-        return reactor.candidates().stream().map(Reactor.Module::name)
+        return launch.reactor().candidates().stream().map(Reactor.Module::name)
                 .filter(name -> !loop.contains(name)).distinct().toList();
     }
 
@@ -445,7 +444,7 @@ public final class Daemon {
         // every module is out would be a claim the daemon has not made.
         List<String> excluded = loop.isEmpty() ? List.of()
                 : excludedModules(loop);
-        return "{\"reactorRoot\":\"" + Json.escape(reactor.root().toString())
+        return "{\"reactorRoot\":\"" + Json.escape(launch.reactor().root().toString())
                 + "\",\"loop\":" + Json.strings(loop) + ",\"excluded\":"
                 + Json.strings(excluded) + "}";
     }

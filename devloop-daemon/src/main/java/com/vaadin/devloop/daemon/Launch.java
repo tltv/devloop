@@ -55,7 +55,13 @@ final class Launch {
      */
     private static final String CLASSPATH_FILE = "target/devloop/cp.txt";
 
-    private final Reactor reactor;
+    /**
+     * Re-read whenever a pom changes: a pom edit can add or remove a module, and
+     * the aggregation graph is what the cache stamp is computed from - so a module
+     * that did not exist when the daemon started would otherwise never be watched.
+     */
+    private volatile Reactor reactor;
+
     private final Path root;
     private final Log log;
 
@@ -69,6 +75,14 @@ final class Launch {
      * javac a classpath of one directory and printing a hundred consequences.
      */
     private volatile String resolutionError;
+
+    /**
+     * Whether the classpath in hand is the synthetic app-only fallback, as opposed
+     * to a real resolution that has merely gone stale. Launching against the
+     * former cannot work; launching against the latter is a judgement call the
+     * developer should be told about, not refused.
+     */
+    private volatile boolean classpathUnusable;
 
     /**
      * The classpath the running app was actually launched with.
@@ -287,6 +301,10 @@ final class Launch {
         }
         try {
             if (!stampIsCurrent()) {
+                // Before Maven, not after: a pom edit may have added or removed a
+                // module, and re-reading here is what puts a newly added pom into
+                // the stamp - otherwise it would never be watched at all.
+                reactor = Reactor.discover(root, tee);
                 runMaven(tee);
                 writeStamp();
                 resolutions++;
@@ -294,14 +312,19 @@ final class Launch {
             Project resolved = read();
             project = resolved;
             resolutionError = null;
+            classpathUnusable = false;
             return resolved;
         } catch (IOException e) {
             tee.line("classpath resolution failed: " + e.getMessage());
+            // Recorded either way. Keeping the last good classpath is what lets
+            // status keep answering, but it must not let an apply claim success: a
+            // project that cannot resolve is not a project with no changes.
+            resolutionError = e.getMessage();
             if (current != null) {
-                tee.line("keeping the previous classpath");
+                tee.line("keeping the last classpath that resolved");
                 return current;
             }
-            resolutionError = e.getMessage();
+            classpathUnusable = true;
             Project fallback = new Project(List.of(reactor.app()),
                     reactor.app().classesDir().toString(), Map.of());
             project = fallback;
@@ -391,6 +414,11 @@ final class Launch {
         }
         return String.join(", ", names.subList(0, 3)) + " and "
                 + (names.size() - 3) + " more";
+    }
+
+    /** The aggregation graph as last read; refreshed whenever a pom changes. */
+    Reactor reactor() {
+        return reactor;
     }
 
     /** What has been resolved so far, without resolving: {@code status} must not build. */
@@ -641,7 +669,7 @@ final class Launch {
         if (online.ok()) {
             return;
         }
-        throw new IOException(maven + ": " + lastLines(online.output(), 10));
+        throw new IOException(maven + ": " + failureReason(online.output()));
     }
 
     private record Attempt(boolean ok, String output) {
@@ -860,6 +888,38 @@ final class Launch {
         }
     }
 
+    /**
+     * Maven's own words for why it failed - the first real {@code [ERROR]} line.
+     * <p>
+     * Not the tail of the output: Maven ends every failure with eight lines of
+     * "re-run with -e", "[Help 1]" and "you can resume the build with", so a tail
+     * reports the epilogue and never the cause.
+     * <p>
+     * The first few error lines rather than only the first, because Maven splits
+     * the answer: line one says which goal failed on which project, and the line
+     * after it is the one that names the artifact it could not resolve.
+     */
+    private static String failureReason(String output) {
+        List<String> errors = output.lines().map(String::strip)
+                .filter(line -> line.startsWith("[ERROR]"))
+                .map(line -> line.substring("[ERROR]".length()).strip())
+                .filter(line -> !line.isEmpty())
+                .filter(line -> !BOILERPLATE.matcher(line).find())
+                .map(line -> line.replaceAll("\\s*->\\s*\\[Help \\d+\\]$", ""))
+                .limit(3).toList();
+        if (errors.isEmpty()) {
+            return lastLines(output, 10);
+        }
+        String reason = String.join(" | ", errors);
+        return reason.length() <= 400 ? reason
+                : reason.substring(0, 397) + "...";
+    }
+
+    private static final java.util.regex.Pattern BOILERPLATE = java.util.regex.Pattern
+            .compile("^(To see the full stack trace|Re-run Maven|"
+                    + "For more information about the errors|"
+                    + "After correcting the problems|\\[Help \\d+\\]|mvn <args>)");
+
     private static String lastLines(String output, int count) {
         List<String> lines = output.strip().lines().toList();
         return String.join(" | ",
@@ -873,10 +933,14 @@ final class Launch {
         Path haJar = ensureHotswapAgent();
         Path connectorAgent = agentJar();
         Project resolved = project();
-        if (resolutionError != null) {
-            // Launching against the fallback classpath would fail inside the app
+        if (classpathUnusable) {
+            // Launching against the app-only fallback would fail inside the app
             // with a stack trace instead of here with the reason.
             throw new IOException("classpath: " + resolutionError);
+        }
+        if (resolutionError != null) {
+            log.line("WARNING: launching with the last classpath that resolved; "
+                    + "the build does not currently resolve: " + resolutionError);
         }
 
         List<String> cmd = new ArrayList<>();
