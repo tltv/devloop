@@ -83,12 +83,12 @@
              the daemon reaches the app, and why it needs nothing but the app's own
              classpath. Optional so it can never reach a production build - it only
              acts in dev mode, and only when the daemon launched the JVM. -->
-        <dependency>
-            <groupId>com.dev.vaadin.example</groupId>
-            <artifactId>flow-devloop</artifactId>
-            <version>${flow-devloop.version}</version>
-            <optional>true</optional>
-        </dependency>
+<!--        <dependency>-->
+<!--            <groupId>com.dev.vaadin.example</groupId>-->
+<!--            <artifactId>flow-devloop</artifactId>-->
+<!--            <version>${flow-devloop.version}</version>-->
+<!--            <optional>true</optional>-->
+<!--        </dependency>-->
 
         <dependency>
             <groupId>org.springframework.boot</groupId>
