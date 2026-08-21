@@ -1,5 +1,6 @@
 package com.vaadin.devloop.daemon;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -11,13 +12,17 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
- * Composes the app JVM command line, and provisions HotswapAgent so the user
- * never has to.
+ * Composes the app JVM command line, resolves the classpath through Maven, and
+ * provisions HotswapAgent so the user never has to.
  * <p>
  * Phase 0.5 established that getting the flag set right matters as much as
  * having the jar: without the JPMS opens, HotswapAgent's core helper fails on
@@ -41,12 +46,74 @@ final class Launch {
             "java.base/java.io", "java.base/java.util",
             "java.desktop/java.beans");
 
+    /**
+     * Where each module is told to write its classpath, <em>relative</em> on
+     * purpose: Maven aligns a relative {@code File} plugin parameter to the
+     * executing project's own basedir, so one reactor invocation leaves every
+     * module its own file instead of all of them overwriting one. An absolute
+     * path made that a race the application module only won by sorting last.
+     */
+    private static final String CLASSPATH_FILE = "target/devloop/cp.txt";
+
+    private final Reactor reactor;
     private final Path root;
     private final Log log;
 
-    Launch(Path root, Log log) {
-        this.root = root;
+    /** The last successful resolution, so a Maven failure degrades instead of breaking. */
+    private volatile Project project;
+
+    /**
+     * Why the last resolution failed, when it failed and there was no earlier
+     * answer to fall back on. Kept rather than thrown so {@code status} can
+     * report it, and so an {@code apply} says "classpath: ..." instead of handing
+     * javac a classpath of one directory and printing a hundred consequences.
+     */
+    private volatile String resolutionError;
+
+    /**
+     * The classpath the running app was actually launched with.
+     * <p>
+     * A JVM's class path is fixed for its lifetime, so this is the only way to
+     * answer "is the running app still the app the poms describe?". Editing a pom
+     * changes what the build resolves and nothing about the process already
+     * running - and since a pom edit touches no {@code .java} file, the source
+     * scan finds nothing and the apply used to report "no changes" over an app
+     * running a classpath that no longer exists on paper.
+     */
+    private volatile String launchedClasspath;
+
+    /** How many times Maven has actually been run, so a caller can tell. */
+    private volatile long resolutions;
+
+    /** Which poms moved the last time the stamp was rewritten, app-relative. */
+    private volatile List<String> changedPoms = List.of();
+
+    Launch(Reactor reactor, Log log) {
+        this.reactor = reactor;
+        this.root = reactor.app().dir();
         this.log = log;
+    }
+
+    /**
+     * The resolved shape of the build: which modules are in the edit loop, what
+     * the app runs with, and what each module compiles against.
+     * <p>
+     * Per-module compile classpaths rather than one shared one, because sharing
+     * the application's would let a library module compile against a type only
+     * the application declares - javac would pass and Maven could never build it
+     * - and would hide a module cycle behind a green apply.
+     */
+    record Project(List<Reactor.Module> modules, String appClasspath,
+            Map<String, String> compileClasspath) {
+
+        String compileClasspath(Reactor.Module module) {
+            return compileClasspath.getOrDefault(module.artifactId(),
+                    appClasspath);
+        }
+
+        Reactor.Module app() {
+            return modules.get(0);
+        }
     }
 
     /**
@@ -189,51 +256,608 @@ final class Launch {
     }
 
     /**
-     * The classpath, cached and invalidated on pom.xml changes - the same cache
-     * the compile leg will use in P2.
+     * The resolved build, from the cache when every pom in the reactor is older
+     * than the stamp, and from Maven when one is not.
+     * <p>
+     * Never fatal. A Maven failure keeps the last good answer, or falls back to
+     * the application module alone, and says so - a project the daemon cannot
+     * resolve is still a project it can report on, and {@code status} must never
+     * pay for a build.
      */
-    String classpath() throws IOException {
-        Path cache = workDir(root).resolve("cp.txt");
-        Path pom = root.resolve("pom.xml");
-        boolean stale = !Files.isRegularFile(cache) || (Files.isRegularFile(pom)
-                && Files.getLastModifiedTime(pom)
-                        .compareTo(Files.getLastModifiedTime(cache)) > 0);
-        if (stale) {
-            log.line("resolving classpath (pom.xml newer than cache)");
-            Files.createDirectories(cache.getParent());
-            // The application's own wrapper. The daemon works against one app and
-            // uses only that app's build, so it looks no further than the app dir.
-            // Chosen by platform, not by which file happens to exist: a project
-            // generated on Windows ships both wrappers, and mvnw.cmd is a batch
-            // file that a Linux or macOS shell cannot run.
-            String mvnw = mavenWrapper().toString();
-            Process process = new ProcessBuilder(mvnw, "-q", "-o",
-                    "dependency:build-classpath",
-                    "-Dmdep.outputFile=" + cache).directory(root.toFile())
-                            .redirectErrorStream(true).start();
-            String output;
-            try (InputStream in = process.getInputStream()) {
-                output = new String(in.readAllBytes());
-            }
-            try {
-                if (process.waitFor() != 0) {
-                    // The wrapper's own words: without them a failure here is a
-                    // dead end, and this is the first build the daemon ever runs.
-                    throw new IOException("classpath resolution failed ("
-                            + mvnw + "): " + lastLines(output, 10));
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("classpath resolution interrupted", e);
-            }
-        }
-        return Files.readString(cache).trim() + java.io.File.pathSeparator
-                + root.resolve("target").resolve("classes");
+    Project project() {
+        return project(text -> {
+        });
     }
 
-    /** The Maven wrapper for this platform, inside the application. */
-    private Path mavenWrapper() {
-        return root.resolve(WINDOWS ? "mvnw.cmd" : "mvnw");
+    /**
+     * As {@link #project()}, with resolution progress copied to a caller's log.
+     * <p>
+     * Running Maven costs seconds, and an {@code apply} that spends them in
+     * silence looks wedged - and then reports "no changes", which reads as though
+     * it never noticed the pom at all.
+     */
+    Project project(Log progress) {
+        Log tee = text -> {
+            log.line(text);
+            progress.line(text);
+        };
+        Project current = project;
+        if (current != null && stampIsCurrent()) {
+            return current;
+        }
+        try {
+            if (!stampIsCurrent()) {
+                runMaven(tee);
+                writeStamp();
+                resolutions++;
+            }
+            Project resolved = read();
+            project = resolved;
+            resolutionError = null;
+            return resolved;
+        } catch (IOException e) {
+            tee.line("classpath resolution failed: " + e.getMessage());
+            if (current != null) {
+                tee.line("keeping the previous classpath");
+                return current;
+            }
+            resolutionError = e.getMessage();
+            Project fallback = new Project(List.of(reactor.app()),
+                    reactor.app().classesDir().toString(), Map.of());
+            project = fallback;
+            return fallback;
+        }
+    }
+
+    /** Set when {@link #project()} last had to fall back; empty when it is sound. */
+    Optional<String> resolutionError() {
+        return Optional.ofNullable(resolutionError);
+    }
+
+    /**
+     * How the build's classpath now differs from the one the running app was
+     * launched with, in words; empty when they still agree or when nothing has
+     * been launched.
+     * <p>
+     * This is the observable consequence of a pom edit. Names what moved rather
+     * than only that something did, because "restarting" without a reason is
+     * indistinguishable from the daemon deciding to restart on a whim.
+     */
+    Optional<String> classpathDrift() {
+        String launched = launchedClasspath;
+        if (launched == null) {
+            return Optional.empty();
+        }
+        String current = project().appClasspath();
+        Set<String> before = new LinkedHashSet<>(split(launched));
+        Set<String> after = new LinkedHashSet<>(split(current));
+        if (before.equals(after)) {
+            // Membership, not order. Maven reorders a classpath for edits that
+            // change nothing about what is on it, and restarting an app to hand
+            // it the same jars in a different sequence is noise - the developer
+            // cannot tell it from the daemon restarting on a whim.
+            return Optional.empty();
+        }
+        List<String> added = after.stream().filter(e -> !before.contains(e))
+                .map(Launch::entryName).toList();
+        List<String> removed = before.stream().filter(e -> !after.contains(e))
+                .map(Launch::entryName).toList();
+        List<String> parts = new ArrayList<>();
+        if (!added.isEmpty()) {
+            parts.add("added " + summarise(added));
+        }
+        if (!removed.isEmpty()) {
+            parts.add("removed " + summarise(removed));
+        }
+        return Optional.of(String.join(", ", parts));
+    }
+
+    /**
+     * A classpath reduced to what is on it, so two resolutions that differ only
+     * in order compare equal. Used wherever the question is "is this still the
+     * same classpath?" rather than "in what order will it be searched?".
+     */
+    static String membership(String classpath) {
+        return String.join(File.pathSeparator,
+                split(classpath).stream().distinct().sorted().toList());
+    }
+
+    private static List<String> split(String classpath) {
+        return List.of(classpath.split(
+                java.util.regex.Pattern.quote(File.pathSeparator)));
+    }
+
+    /** A jar or a module output directory, as a developer would name it. */
+    private static String entryName(String entry) {
+        Path path = Path.of(entry);
+        Path name = path.getFileName();
+        if (name == null) {
+            return entry;
+        }
+        if (!"classes".equals(name.toString())) {
+            return name.toString();
+        }
+        // <module>/target/classes reads as nothing on its own.
+        Path module = path.getParent() == null ? null
+                : path.getParent().getParent();
+        return module == null || module.getFileName() == null ? entry
+                : module.getFileName() + "/target/classes";
+    }
+
+    /** Enough names to recognise the change by, then a count for the rest. */
+    private static String summarise(List<String> names) {
+        if (names.size() <= 3) {
+            return String.join(", ", names);
+        }
+        return String.join(", ", names.subList(0, 3)) + " and "
+                + (names.size() - 3) + " more";
+    }
+
+    /** What has been resolved so far, without resolving: {@code status} must not build. */
+    Optional<Project> resolved() {
+        return Optional.ofNullable(project);
+    }
+
+    /**
+     * Builds the project model from what Maven left on disk: the app module's
+     * classpath file, plus one file per module in the {@code -am} closure.
+     */
+    private Project read() throws IOException {
+        Path cache = workDir(root).resolve("cp.txt");
+        if (!Files.isRegularFile(cache)) {
+            throw new IOException("no classpath file at " + cache);
+        }
+        List<String> entries = entriesOf(cache);
+        List<Reactor.Module> modules = selectModules(entries);
+        Map<String, String> compile = new LinkedHashMap<>();
+        for (Reactor.Module module : modules) {
+            Path own = workDir(module.dir()).resolve("cp.txt");
+            List<String> ownEntries = Files.isRegularFile(own) ? entriesOf(own)
+                    : entries;
+            compile.put(module.artifactId(),
+                    assemble(List.of(module), modules, ownEntries));
+        }
+        return new Project(modules, assemble(modules, modules, entries),
+                compile);
+    }
+
+    private static List<String> entriesOf(Path file) throws IOException {
+        String raw = Files.readString(file).trim();
+        return raw.isEmpty() ? List.of()
+                : List.of(raw.split(java.util.regex.Pattern
+                        .quote(File.pathSeparator)));
+    }
+
+    /**
+     * Which modules are in the edit loop.
+     * <p>
+     * Read off the resolved classpath rather than reconstructed from poms: the
+     * only <em>directory</em> entries Maven emits are reactor modules' output
+     * directories, so this is exactly the set of modules the application depends
+     * on - transitively, after profiles and dependency management, and correct
+     * even for a module that overrides {@code <outputDirectory>}. It also means
+     * the loop cannot contain a module the application does not actually use.
+     */
+    private List<Reactor.Module> selectModules(List<String> entries) {
+        List<Reactor.Module> modules = new ArrayList<>();
+        modules.add(reactor.app());
+        Optional<List<Path>> forced = forcedModuleDirs();
+        if (forced.isPresent()) {
+            for (Path dir : forced.get()) {
+                addModule(modules, dir, null);
+            }
+            return List.copyOf(modules);
+        }
+        for (String entry : entries) {
+            Path path = Path.of(entry);
+            if (!Files.isDirectory(path)) {
+                continue;
+            }
+            Path owner = moduleDirOf(path);
+            if (owner != null) {
+                addModule(modules, owner, path);
+            }
+        }
+        return List.copyOf(modules);
+    }
+
+    /**
+     * {@code vaadin.dev.modules}: unset means auto; {@code .} or empty means the
+     * application alone, which is the daemon's pre-reactor behaviour and the
+     * escape hatch when discovery gets it wrong; anything else is a list of
+     * directories, absolute or relative to the application.
+     */
+    private Optional<List<Path>> forcedModuleDirs() {
+        String configured = System.getProperty("vaadin.dev.modules");
+        if (configured == null) {
+            return Optional.empty();
+        }
+        List<Path> dirs = new ArrayList<>();
+        for (String value : configured.split(",")) {
+            String trimmed = value.trim();
+            if (trimmed.isEmpty() || ".".equals(trimmed)) {
+                continue;
+            }
+            Path dir = Reactor.real(root.resolve(trimmed));
+            if (Files.isRegularFile(dir.resolve("pom.xml"))) {
+                dirs.add(dir);
+            } else {
+                log.line("vaadin.dev.modules: skipping " + trimmed
+                        + " - no pom.xml there");
+            }
+        }
+        return Optional.of(dirs);
+    }
+
+    private void addModule(List<Reactor.Module> into, Path dir, Path classesDir) {
+        Path owner = Reactor.real(dir);
+        if (into.stream().anyMatch(module -> module.dir().equals(owner))) {
+            return;
+        }
+        String artifactId = reactor.candidates().stream()
+                .filter(candidate -> candidate.dir().equals(owner)).findFirst()
+                .map(Reactor.Module::artifactId).orElse(owner.getFileName() == null
+                        ? owner.toString() : owner.getFileName().toString());
+        Reactor.Module module = classesDir == null
+                ? Reactor.Module.of(owner, artifactId)
+                : Reactor.Module.of(owner, artifactId, classesDir);
+        if (!module.hasSources()) {
+            return;
+        }
+        if (!Files.isDirectory(module.classesDir())) {
+            // Then the JVM will load those classes from the installed jar until
+            // the first apply writes here, which mixes two builds. It still
+            // works - a redefine acts on the loaded Class, whatever it came from
+            // - but it is not something to discover from behaviour.
+            log.line("module " + module.name() + " has no "
+                    + module.classesDir().getFileName()
+                    + " yet; build it once for a clean baseline");
+        }
+        into.add(module);
+    }
+
+    /** The nearest ancestor that is a Maven module, never above the reactor root. */
+    private Path moduleDirOf(Path classesDir) {
+        Path root = reactor.root();
+        for (Path dir = classesDir.getParent(); dir != null; dir = dir
+                .getParent()) {
+            if (Files.isRegularFile(dir.resolve("pom.xml"))) {
+                return dir;
+            }
+            if (dir.equals(root)) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The classpath the JVM (or javac) is given: the named modules' output first,
+     * then Maven's answer with every in-loop module's own installed jar removed.
+     * <p>
+     * Both halves are needed. Maven substitutes a module's {@code target/classes}
+     * only for modules that took part in the reactor build, so a jar can still
+     * appear - and then it is not enough to merely put the directory first:
+     * {@code getResources()} returns <em>both</em> copies, and Spring's component
+     * scanning, {@code META-INF/services} and Flow's class finder all iterate
+     * rather than take the first. So the stale copy is dropped, not shadowed.
+     */
+    private String assemble(List<Reactor.Module> first,
+            List<Reactor.Module> inLoop, List<String> entries) {
+        Set<String> out = new LinkedHashSet<>();
+        first.forEach(module -> out.add(module.classesDir().toString()));
+        for (String entry : entries) {
+            if (!isSupersededJar(entry, inLoop)) {
+                out.add(entry);
+            }
+        }
+        return String.join(File.pathSeparator, out);
+    }
+
+    /**
+     * Whether a classpath entry is the installed jar of a module that is in the
+     * loop. Matched on the local repository's own layout
+     * ({@code .../<artifactId>/<version>/<file>}) rather than on the file name:
+     * {@code <finalName>}, classifiers and {@code ${revision}} versions all make
+     * {@code artifactId-version.jar} the wrong thing to compare.
+     */
+    private boolean isSupersededJar(String entry,
+            List<Reactor.Module> modules) {
+        Path path = Path.of(entry);
+        if (Files.isDirectory(path)) {
+            // A directory entry is a module's output, not a copy of one. It also
+            // sits under <module>/target/classes, whose grandparent is the module
+            // directory - which the repository-layout test below would read as an
+            // artifactId and drop, taking the sibling off its own classpath.
+            return false;
+        }
+        Path versionDir = path.getParent();
+        Path artifactDir = versionDir == null ? null : versionDir.getParent();
+        if (artifactDir == null || artifactDir.getFileName() == null) {
+            return false;
+        }
+        String artifactId = artifactDir.getFileName().toString();
+        return modules.stream()
+                .anyMatch(module -> module.artifactId().equals(artifactId));
+    }
+
+    /**
+     * Resolves the classpath through Maven.
+     * <p>
+     * Two parts of this command line are load-bearing. {@code -pl :app -am} is
+     * what gives the reactor a chance to answer at all: run from the application
+     * module alone there is no reactor, and a sibling resolves to whatever jar
+     * happens to be installed - measured, and the reason an edit in a sibling
+     * module used to be invisible. And {@code compile} is what makes the answer
+     * be {@code target/classes}: Maven's reactor reader substitutes a module's
+     * output directory only when that module's {@code compile} phase actually ran
+     * in the same session, so the goal on its own hands back a stale jar. It also
+     * means a fresh clone resolves without anything having been installed first.
+     * <p>
+     * {@code build-frontend} is bound to {@code prepare-package}, so this stops
+     * well short of a frontend build.
+     */
+    long resolutions() {
+        return resolutions;
+    }
+
+    /** The poms that changed the last time this daemon re-resolved. */
+    List<String> changedPoms() {
+        return changedPoms;
+    }
+
+    private void runMaven(Log progress) throws IOException {
+        Path maven = mavenCommand();
+        List<String> base = new ArrayList<>(
+                List.of(maven.toString(), "-B", "-ntp"));
+        if (reactor.isMultiModule()) {
+            base.addAll(List.of("-f",
+                    reactor.root().resolve("pom.xml").toString(), "-pl",
+                    ":" + reactor.app().artifactId(), "-am"));
+        }
+        base.addAll(List.of("compile", "dependency:build-classpath",
+                "-Dmdep.outputFile=" + CLASSPATH_FILE,
+                // Off by default, and then an unchanged classpath is not
+                // rewritten at all - which made every apply after a pom edit
+                // re-run Maven, because the file it compares against never got
+                // any newer.
+                "-Dmdep.regenerateFile=true", "-Dmaven.test.skip=true"));
+
+        progress.line("resolving classpath and building " + reactor.app().name()
+                + (reactor.isMultiModule()
+                        ? " and the modules it depends on" : ""));
+        warnAboutIgnoredMavenConfig();
+
+        // Offline first: it is the fast path and the air-gapped one. But a cold
+        // local repository fails while building the model - a parent pom it has
+        // never seen - long before it gets to dependencies, so a single retry
+        // online is the difference between a working first run and a dead end.
+        Attempt offline = attempt(base, true);
+        if (offline.ok()) {
+            return;
+        }
+        log.line("offline resolution failed; retrying online");
+        Attempt online = attempt(base, false);
+        if (online.ok()) {
+            return;
+        }
+        throw new IOException(maven + ": " + lastLines(online.output(), 10));
+    }
+
+    private record Attempt(boolean ok, String output) {
+    }
+
+    private Attempt attempt(List<String> base, boolean offline)
+            throws IOException {
+        List<String> command = new ArrayList<>(base);
+        // After the wrapper, before the goals: Maven accepts options anywhere,
+        // and inserting here keeps the goals last where a reader expects them.
+        command.addAll(1, offline ? List.of("-o") : List.of("-nsu"));
+        Path directory = reactor.root();
+        ProcessBuilder builder = new ProcessBuilder(command)
+                .directory(directory.toFile()).redirectErrorStream(true);
+        // The distribution's launcher derives maven.multiModuleProjectDirectory
+        // by walking up from the working directory looking for .mvn - which this
+        // repository has in the application module, not at the root. Setting it
+        // explicitly takes that guess out of the picture.
+        builder.environment().put("MAVEN_BASEDIR", directory.toString());
+        Process process = builder.start();
+        String output;
+        try (InputStream in = process.getInputStream()) {
+            output = new String(in.readAllBytes());
+        }
+        try {
+            return new Attempt(process.waitFor() == 0, output);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("classpath resolution interrupted", e);
+        }
+    }
+
+    /**
+     * The Maven to run: an explicit override, then the wrapper nearest the
+     * reactor root (the version the reactor was written for), then any wrapper
+     * between the application and the root, then Maven on the PATH.
+     * <p>
+     * The wrapper script reads {@code .mvn/wrapper/maven-wrapper.properties}
+     * relative to <em>itself</em>, not to the working directory, so an absolute
+     * path to it works from anywhere. Chosen by platform, not by which file
+     * happens to exist: a project generated on Windows ships both wrappers, and
+     * {@code mvnw.cmd} is a batch file no Linux or macOS shell can run.
+     */
+    private Path mavenCommand() throws IOException {
+        String override = System.getProperty("vaadin.dev.maven");
+        if (override != null && !override.isBlank()) {
+            return Path.of(override);
+        }
+        String wrapper = WINDOWS ? "mvnw.cmd" : "mvnw";
+        List<Path> searched = new ArrayList<>();
+        List<Path> candidates = new ArrayList<>();
+        candidates.add(reactor.root());
+        for (Path dir = root; dir != null
+                && !dir.equals(reactor.root()); dir = dir.getParent()) {
+            candidates.add(dir);
+        }
+        for (Path dir : candidates) {
+            Path candidate = dir.resolve(wrapper);
+            searched.add(candidate);
+            if (Files.isRegularFile(candidate)) {
+                return candidate;
+            }
+        }
+        Optional<Path> onPath = mavenOnPath();
+        if (onPath.isPresent()) {
+            log.line("no Maven wrapper found; using " + onPath.get());
+            return onPath.get();
+        }
+        throw new IOException("no Maven wrapper and no mvn on PATH; looked for "
+                + searched.stream().map(Path::toString).toList());
+    }
+
+    /**
+     * Maven on the PATH, resolved by hand because {@code ProcessBuilder} does not
+     * apply {@code PATHEXT}: handed the literal "mvn" on Windows it would never
+     * find {@code mvn.cmd}.
+     */
+    private Optional<Path> mavenOnPath() {
+        List<String> names = WINDOWS
+                ? List.of("mvn.cmd", "mvn.bat", "mvn.exe", "mvn")
+                : List.of("mvn");
+        List<String> homes = new ArrayList<>();
+        for (String variable : List.of("MAVEN_HOME", "M2_HOME")) {
+            String value = System.getenv(variable);
+            if (value != null && !value.isBlank()) {
+                homes.add(value + File.separator + "bin");
+            }
+        }
+        String path = System.getenv("PATH");
+        if (path != null) {
+            homes.addAll(List.of(path.split(File.pathSeparator)));
+        }
+        for (String dir : homes) {
+            for (String name : names) {
+                Path candidate = Path.of(dir).resolve(name);
+                if (Files.isRegularFile(candidate)) {
+                    return Optional.of(candidate);
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Driving the build from the reactor root means Maven looks for
+     * {@code .mvn/maven.config} there, so a config kept in the application module
+     * stops being applied. Silently changing which arguments a build gets is not
+     * something to leave for someone to discover.
+     */
+    private void warnAboutIgnoredMavenConfig() {
+        if (!reactor.isMultiModule()) {
+            return;
+        }
+        Path config = root.resolve(".mvn").resolve("maven.config");
+        if (Files.isRegularFile(config)
+                && !Files.isRegularFile(reactor.root().resolve(".mvn")
+                        .resolve("maven.config"))) {
+            log.line("WARNING: " + config + " is not read when the build runs "
+                    + "from " + reactor.root() + "; move it to the reactor root");
+        }
+    }
+
+    /**
+     * The cache stamp: every pom in the reactor, by modification time and size.
+     * <p>
+     * A stamp rather than a comparison against {@code cp.txt}'s own timestamp,
+     * for two reasons. The plugin does not rewrite the file when the classpath is
+     * unchanged, so its timestamp stops moving while poms keep changing; and in a
+     * reactor any pom can change what the application resolves, including one in
+     * a module that is not in the loop.
+     */
+    private Path stampFile() {
+        return workDir(root).resolve("cp.stamp");
+    }
+
+    private String currentStamp() {
+        StringBuilder sb = new StringBuilder();
+        for (Path pom : reactor.poms()) {
+            sb.append(pom);
+            try {
+                sb.append('\t').append(Files.getLastModifiedTime(pom).toMillis())
+                        .append('\t').append(Files.size(pom));
+            } catch (IOException e) {
+                sb.append("\tmissing");
+            }
+            sb.append('\n');
+        }
+        return sb.toString();
+    }
+
+    private boolean stampIsCurrent() {
+        Path stamp = stampFile();
+        if (!Files.isRegularFile(stamp)
+                || !Files.isRegularFile(workDir(root).resolve("cp.txt"))) {
+            return false;
+        }
+        try {
+            return Files.readString(stamp).equals(currentStamp());
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private void writeStamp() throws IOException {
+        Path stamp = stampFile();
+        String next = currentStamp();
+        changedPoms = changedSince(stamp, next);
+        Files.createDirectories(stamp.getParent());
+        Files.writeString(stamp, next);
+    }
+
+    /**
+     * Which poms differ between the stored stamp and the one about to replace it.
+     * Named because "a pom changed" in a reactor of ten is not an answer.
+     */
+    private List<String> changedSince(Path stamp, String next) {
+        Map<String, String> before = stampLines(readOrEmpty(stamp));
+        Map<String, String> after = stampLines(next);
+        List<String> changed = new ArrayList<>();
+        after.forEach((path, fingerprint) -> {
+            if (!fingerprint.equals(before.get(path))) {
+                changed.add(relative(Path.of(path)));
+            }
+        });
+        before.keySet().stream().filter(path -> !after.containsKey(path))
+                .forEach(path -> changed.add(relative(Path.of(path))));
+        return List.copyOf(changed);
+    }
+
+    private static String readOrEmpty(Path file) {
+        try {
+            return Files.isRegularFile(file) ? Files.readString(file) : "";
+        } catch (IOException e) {
+            return "";
+        }
+    }
+
+    private static Map<String, String> stampLines(String stamp) {
+        Map<String, String> lines = new LinkedHashMap<>();
+        stamp.lines().filter(line -> !line.isBlank()).forEach(line -> {
+            int at = line.indexOf('	');
+            if (at > 0) {
+                lines.put(line.substring(0, at), line.substring(at + 1));
+            }
+        });
+        return lines;
+    }
+
+    /** A path as the developer would type it, relative to the application. */
+    private String relative(Path path) {
+        try {
+            return root.relativize(path).toString().replace(File.separatorChar,
+                    '/');
+        } catch (IllegalArgumentException e) {
+            return path.toString();
+        }
     }
 
     private static String lastLines(String output, int count) {
@@ -248,6 +872,12 @@ final class Launch {
         Path java = javaBinary();
         Path haJar = ensureHotswapAgent();
         Path connectorAgent = agentJar();
+        Project resolved = project();
+        if (resolutionError != null) {
+            // Launching against the fallback classpath would fail inside the app
+            // with a stack trace instead of here with the reason.
+            throw new IOException("classpath: " + resolutionError);
+        }
 
         List<String> cmd = new ArrayList<>();
         cmd.add(java.toString());
@@ -289,14 +919,24 @@ final class Launch {
         // bundle) without the daemon needing to know each option.
         System.getProperties().stringPropertyNames().stream()
                 .filter(name -> name.startsWith("vaadin.")
-                        && !name.equals("vaadin.launch-browser"))
+                        && !name.equals("vaadin.launch-browser")
+                        && !name.equals("vaadin.devloop.classes"))
                 .sorted().forEach(name -> cmd
                         .add("-D" + name + "=" + System.getProperty(name)));
         cmd.add("-Dvaadin.devloop.daemonPort=" + daemonPort);
         cmd.add("-Dvaadin.devloop.token=" + token);
+        // Where the connector reads the bytes of a class it is asked to redefine.
+        // A list, in classpath order, because a change can land in any in-loop
+        // module's output and the REDEFINE request carries only binary names.
+        cmd.add("-Dvaadin.devloop.classes="
+                + String.join(File.pathSeparator, resolved.modules().stream()
+                        .map(module -> module.classesDir().toString()).toList()));
         cmd.add("-cp");
-        cmd.add(classpath());
+        cmd.add(resolved.appClasspath());
         cmd.add(mainClass);
+        // Recorded here rather than in AppProcess: this is the last point at which
+        // what the JVM will run is still in one place.
+        launchedClasspath = resolved.appClasspath();
         return cmd;
     }
 

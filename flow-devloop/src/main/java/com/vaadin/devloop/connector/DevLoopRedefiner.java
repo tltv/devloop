@@ -1,5 +1,6 @@
 package com.vaadin.devloop.connector;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -19,6 +20,7 @@ import java.util.Map;
 import java.util.Set;
 
 import com.vaadin.base.devserver.hotswap.Hotswapper;
+import com.vaadin.flow.component.Component;
 import com.vaadin.flow.internal.BrowserLiveReloadAccessor;
 import com.vaadin.flow.internal.DevModeHandlerManager;
 import com.vaadin.flow.server.VaadinService;
@@ -61,8 +63,7 @@ final class DevLoopRedefiner {
             return "ERR kind=protocol message=no-classes";
         }
 
-        Path classesDir = Paths
-                .get(System.getProperty("devloop.classes", "target/classes"));
+        List<Path> classesDirs = searchPath();
 
         Map<String, List<Class<?>>> loaded = new HashMap<>();
         // Collected in the same pass, because the one walk over every loaded
@@ -82,6 +83,7 @@ final class DevLoopRedefiner {
         int duplicates = 0;
         Set<String> entities = new LinkedHashSet<>();
         Set<String> beans = new LinkedHashSet<>();
+        Set<String> uiClasses = new LinkedHashSet<>();
 
         for (String name : requested) {
             List<Class<?>> targets = loaded.getOrDefault(name, List.of());
@@ -99,12 +101,13 @@ final class DevLoopRedefiner {
             if (isSpringBean(first)) {
                 beans.add(simple(name));
             }
-            byte[] bytes;
-            try {
-                bytes = Files.readAllBytes(
-                        classesDir.resolve(name.replace('.', '/') + ".class"));
-            } catch (IOException e) {
-                return "ERR kind=missing-class-file message=" + name;
+            if (isUiRefreshed(first)) {
+                uiClasses.add(simple(name));
+            }
+            byte[] bytes = readClassBytes(classesDirs, name);
+            if (bytes == null) {
+                return "ERR kind=missing-class-file searched="
+                        + classesDirs.size() + " message=" + name;
             }
             for (Class<?> target : targets) {
                 definitions.add(new ClassDefinition(target, bytes));
@@ -167,8 +170,60 @@ final class DevLoopRedefiner {
                 + completed + " pageReload=" + pageReload + " entities="
                 + join(entities) + " beans=" + join(beans) + " proxied="
                 + join(proxied) + " structural=" + join(structural)
-                + " hotswapAgent=" + hotswapAgentLoaded() + " redefineMs="
-                + redefineMs + " hotswapMs=" + hotswapMs;
+                + " ui=" + join(uiClasses) + " hotswapAgent="
+                + hotswapAgentLoaded() + " redefineMs=" + redefineMs
+                + " hotswapMs=" + hotswapMs;
+    }
+
+    /**
+     * Where to look for the bytes of a class the daemon asks for.
+     * <p>
+     * A list, because in a multi-module build a change can land in any module's
+     * output directory and the {@code REDEFINE} request carries only binary names
+     * - deliberately, so the wire contract says nothing about where bytes live.
+     * The order is the app's own classpath order, so a class that exists twice
+     * resolves to the copy the JVM resolved. The single relative default keeps a
+     * hand-started app working exactly as it did.
+     */
+    private static List<Path> searchPath() {
+        String configured = System.getProperty("vaadin.devloop.classes",
+                "target/classes");
+        List<Path> dirs = new ArrayList<>();
+        for (String value : configured.split(File.pathSeparator)) {
+            String trimmed = value.trim();
+            if (!trimmed.isEmpty()) {
+                dirs.add(Paths.get(trimmed));
+            }
+        }
+        return dirs;
+    }
+
+    /**
+     * The first copy on the search path wins, which is what the JVM did when it
+     * loaded the class. A second copy is reported rather than fixed: two modules
+     * producing the same class is a build problem, and the only thing worse than
+     * having it is having it silently.
+     */
+    private static byte[] readClassBytes(List<Path> dirs, String name) {
+        String relative = name.replace('.', '/') + ".class";
+        byte[] found = null;
+        for (Path dir : dirs) {
+            Path file = dir.resolve(relative);
+            if (!Files.isRegularFile(file)) {
+                continue;
+            }
+            if (found != null) {
+                System.out.println("[devloop] " + name + " also exists in " + dir
+                        + "; redefining the copy earlier on the classpath");
+                continue;
+            }
+            try {
+                found = Files.readAllBytes(file);
+            } catch (IOException e) {
+                return null;
+            }
+        }
+        return found;
     }
 
     /**
@@ -351,6 +406,32 @@ final class DevLoopRedefiner {
         return java.lang.management.ManagementFactory.getRuntimeMXBean()
                 .getInputArguments().stream()
                 .anyMatch(arg -> arg.contains("AllowEnhancedClassRedefinition"));
+    }
+
+    /**
+     * Whether Flow will visibly refresh anything on account of this class.
+     * <p>
+     * {@code onHotswap} refreshes what Flow owns: component instances and the
+     * route registry. A class that is neither - a formatter, a mapper, a plain
+     * helper called from a renderer - is redefined and live, and yet nothing
+     * re-renders, because a Grid's cell content was rendered on the server and
+     * pushed to the browser once. **Measured**: a method-body change to such a
+     * class left the rendered cells showing their old strings until the next data
+     * refresh, while the redefine reported success - the same shape of silent
+     * over-claim as C7, one level further out. So the connector says which
+     * redefined classes Flow will act on, and the daemon reports the rest as live
+     * but not yet visible rather than simply "Stable".
+     */
+    private static boolean isUiRefreshed(Class<?> type) {
+        if (Component.class.isAssignableFrom(type)) {
+            return true;
+        }
+        // A route target is refreshed through the registry, and a layout or a
+        // service init listener changes what Flow builds, so all of them make
+        // onHotswap do visible work.
+        return hasAnnotation(type, "com.vaadin.flow.router.Route",
+                "com.vaadin.flow.router.RouteAlias",
+                "com.vaadin.flow.router.Layout");
     }
 
     private static boolean isEntity(Class<?> type) {

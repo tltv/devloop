@@ -122,22 +122,67 @@ final class TransactionEngine {
     private static final long ERROR_SETTLE_MILLIS = Long
             .getLong("vaadin.dev.errorSettleMillis", 400L);
 
-    private final Compile compile;
     private final Launch launch;
     private final AppProcess app;
     private final AtomicInteger ids = new AtomicInteger();
     private final ReentrantLock compileLock = new ReentrantLock(true);
 
+    /**
+     * Built from the resolved module set rather than at construction, because
+     * resolving it runs Maven and the daemon must be answering on its socket long
+     * before that finishes. Rebuilt when the module set changes.
+     */
+    private volatile Compile compile;
+
     private volatile Connector connector;
     private volatile Transaction inFlight;
     private volatile Transaction last;
 
-    TransactionEngine(Path root, Launch launch, AppProcess app) {
-        this.compile = new Compile(root);
+    TransactionEngine(Launch launch, AppProcess app) {
         this.launch = launch;
         this.app = app;
-        // Seeded now so an untouched project reports "no changes" on first apply.
-        this.compile.seedFromDisk();
+    }
+
+    /**
+     * The compile leg for the current module set, seeded from disk the moment it
+     * is built, so an untouched project reports "no changes" on its first apply.
+     * A changed module set - someone edited a pom - starts a new baseline rather
+     * than carrying stamps that describe a different build.
+     */
+    private Compile compileFor(Launch.Project project, Launch.Log log) {
+        Compile current = compile;
+        if (current != null && current.modules().equals(project.modules())) {
+            return current;
+        }
+        if (current != null) {
+            log.line("module set changed; re-seeding the change baseline");
+        }
+        Compile fresh = new Compile(project);
+        fresh.seedFromDisk();
+        compile = fresh;
+        return fresh;
+    }
+
+    /** The poms that moved, named while there are few enough to name. */
+    private static String pomsChanged(List<String> poms) {
+        if (poms.isEmpty()) {
+            return "the build changed";
+        }
+        return poms.size() <= 2 ? String.join(" and ", poms) + " changed"
+                : poms.size() + " poms changed";
+    }
+
+    /**
+     * The scanned change-set plus sources forced by a classpath change, without
+     * duplicates and in the same order the scan would have produced.
+     */
+    private static Compile.Changes merge(Compile.Changes changes,
+            List<Path> forced) {
+        List<Path> modified = new ArrayList<>(changes.modified());
+        forced.stream().filter(path -> !modified.contains(path))
+                .forEach(modified::add);
+        modified.sort(java.util.Comparator.naturalOrder());
+        return new Compile.Changes(modified, changes.deleted());
     }
 
     Optional<Transaction> lastTransaction() {
@@ -169,8 +214,38 @@ final class TransactionEngine {
         }
 
         try {
+            // Resolved before anything is scanned: which modules are in the loop
+            // is what decides where the change-set is even looked for.
+            long resolutionsBefore = launch.resolutions();
+            Launch.Project project = launch.project(log);
+            // Whether a pom actually moved during this apply. Without it, an apply
+            // that spent ten seconds re-resolving reports the same bare "no
+            // changes" as one that did nothing at all - and the reader cannot tell
+            // that the pom edit was seen and deliberately needed no action.
+            boolean reresolved = launch.resolutions() != resolutionsBefore;
+            Optional<String> resolutionError = launch.resolutionError();
+            if (resolutionError.isPresent()) {
+                return finish(tx, Outcome.FAILED,
+                        "classpath: " + resolutionError.get(), "none",
+                        "check the Maven build", started);
+            }
+            compileFor(project, log);
+
             long detectStart = System.nanoTime();
             Compile.Changes changes = compile.stale();
+            // A pom edit changes no source file, so the scan above cannot see
+            // that a module no longer compiles. Whichever module's classpath
+            // moved is recompiled whole - that is the only way the error becomes
+            // a diagnostic instead of a ClassNotFoundException at runtime, or
+            // nothing at all until the next full build.
+            List<Path> forced = compile.classpathForced(project);
+            if (!forced.isEmpty()) {
+                log.line("classpath changed for "
+                        + String.join(", ",
+                                compile.classpathChangedModules(project))
+                        + "; recompiling " + forced.size() + " source(s)");
+                changes = merge(changes, forced);
+            }
             List<Path> staleResources = compile.staleResources();
             tx.detectMs = (System.nanoTime() - detectStart) / 1_000_000;
             tx.changeSet = new ArrayList<>(changes.modified().stream()
@@ -178,6 +253,19 @@ final class TransactionEngine {
             changes.deleted().forEach(
                     path -> tx.changeSet.add(compile.relative(path) + " (deleted)"));
             staleResources.forEach(path -> tx.changeSet.add(compile.relative(path)));
+
+            // A pom edit touches no source file, so the scan above cannot see it -
+            // but it does change what the app would be launched with, and a JVM
+            // cannot be told a new class path. Comparing against what the running
+            // app was actually launched with is the only honest test, and the only
+            // one that stays quiet when a pom edit leaves the classpath alone.
+            Optional<String> drift = app.state() == AppProcess.State.RUNNING
+                    ? launch.classpathDrift() : Optional.empty();
+            drift.ifPresent(detail -> {
+                tx.changeSet.add("classpath: " + detail);
+                log.line("classpath changed (" + detail
+                        + "); only a restart can apply that");
+            });
 
             // From here on, whatever the app logs belongs to this change. Read
             // past what is already there rather than blaming it on this apply.
@@ -201,7 +289,8 @@ final class TransactionEngine {
                 }
             }
 
-            if (changes.isEmpty() && !staleResources.isEmpty()) {
+            if (changes.isEmpty() && !staleResources.isEmpty()
+                    && drift.isEmpty()) {
                 return finishResourceOnly(tx, log, staleResources, started);
             }
             if (!staleResources.isEmpty()) {
@@ -211,58 +300,72 @@ final class TransactionEngine {
                 notifyResources(staleResources, log);
             }
 
-            if (changes.isEmpty()) {
-                return finish(tx, Outcome.NO_CHANGES, "", "none",
-                        "edit a source file, then apply", started);
+            if (changes.isEmpty() && drift.isEmpty()) {
+                // "No changes" is about the disk, and on its own it reads as "all
+                // is well" - which it is not when the app is not running at all.
+                // A crashed app is exactly where this lands after a pom edit the
+                // restart could not survive, and a bare "no changes" there is a
+                // green answer over a dead application.
+                return finish(tx, Outcome.NO_CHANGES,
+                        reresolved ? pomsChanged(launch.changedPoms())
+                                + "; nothing to recompile or restart" : "",
+                        "none",
+                        switch (app.state()) {
+                        case RUNNING -> "edit a source file, then apply";
+                        case CRASHED -> "the app is not running; "
+                                + "vaadin-dev status says why";
+                        default -> "vaadin-dev start";
+                        }, started);
             }
             if (bailIfSuperseded(tx, started)) {
                 return tx;
             }
 
-            tx.state = "compiling";
-            log.line("change-set: " + tx.changeSet.size() + " file(s)");
+            if (!changes.isEmpty()) {
+                tx.state = "compiling";
+                log.line("change-set: " + tx.changeSet.size() + " file(s)");
 
-            String classpath;
-            try {
-                classpath = launch.classpath();
-            } catch (Exception e) {
-                return finish(tx, Outcome.FAILED, "classpath: " + e.getMessage(),
-                        "none", "check the Maven build", started);
-            }
+                Compile.Result result;
+                compileLock.lock();
+                try {
+                    // Re-check after queuing: a newer apply may have taken over
+                    // while we waited, and its change-set already includes ours.
+                    if (bailIfSuperseded(tx, started)) {
+                        return tx;
+                    }
+                    result = compile.compile(changes.modified(), project);
+                } finally {
+                    compileLock.unlock();
+                }
+                tx.compileMs = result.millis();
 
-            Compile.Result result;
-            compileLock.lock();
-            try {
-                // Re-check after queuing: a newer apply may have taken over while
-                // we waited, and its change-set already includes ours.
+                if (!result.success()) {
+                    tx.diagnostics = result.errors();
+                    return finish(tx, Outcome.FAILED, "compile", "none",
+                            result.errors().isEmpty() ? "fix the compile error"
+                                    : result.errors().get(0).hint()
+                                            .orElse("fix the compile error"),
+                            started);
+                }
+                tx.classes = result.writtenClasses();
                 if (bailIfSuperseded(tx, started)) {
                     return tx;
                 }
-                result = compile.compile(changes.modified(), classpath);
-            } finally {
-                compileLock.unlock();
             }
-            tx.compileMs = result.millis();
 
-            if (!result.success()) {
-                tx.diagnostics = result.errors();
-                return finish(tx, Outcome.FAILED, "compile", "none",
-                        result.errors().isEmpty() ? "fix the compile error"
-                                : result.errors().get(0).hint()
-                                        .orElse("fix the compile error"),
-                        started);
-            }
-            tx.classes = result.writtenClasses();
-            if (bailIfSuperseded(tx, started)) {
-                return tx;
-            }
+            // A drifted classpath cannot be redefined away: the running JVM would
+            // keep the dependencies it was started with whatever the bytes say.
+            // So the runtime leg is skipped rather than attempted and undone.
+            drift.ifPresent(detail -> tx.escalation = "classpath changed ("
+                    + detail + ")");
 
             // --- runtime leg: attempt the atomic redefine, escalate if it cannot
             // stick. What actually happened is the authoritative answer; static
             // prediction is only ever a hint.
             Connector connector = this.connector;
-            if (app.state() == AppProcess.State.RUNNING && connector != null
-                    && connector.isOpen() && !tx.classes.isEmpty()) {
+            if (drift.isEmpty() && app.state() == AppProcess.State.RUNNING
+                    && connector != null && connector.isOpen()
+                    && !tx.classes.isEmpty()) {
                 long runtimeStart = System.nanoTime();
                 tx.state = "runtime";
                 Optional<String> reply = connector.command(
@@ -289,7 +392,7 @@ final class TransactionEngine {
                             // apply should not offer them again.
                             compile.markSourcesApplied(changes.modified());
                             return finish(tx, Outcome.STABLE, "", "hot-reload",
-                                    "", started);
+                                    visibilityAdvice(fields), started);
                         }
                         log.line("redefine applied but " + blocker.get()
                                 + "; escalating to restart");
@@ -308,6 +411,12 @@ final class TransactionEngine {
                 String next = app.state() == AppProcess.State.RUNNING
                         ? "run apply without --no-restart to make it live"
                         : "vaadin-dev start";
+                if (drift.isPresent()) {
+                    next = app.state() == AppProcess.State.RUNNING
+                            ? "the app is still running the old classpath; "
+                                    + "apply without --no-restart, or restart it"
+                            : "vaadin-dev start";
+                }
                 return finish(tx, Outcome.COMPILED, "", "compile-only", next,
                         started);
             }
@@ -414,10 +523,13 @@ final class TransactionEngine {
 
     void onConnector(Connector connector) {
         this.connector = connector;
-        if (connector != null) {
+        Compile current = compile;
+        if (connector != null && current != null) {
             // An app that has just registered is running exactly what is on disk,
-            // so that becomes the new "already live" baseline.
-            compile.seedFromDisk();
+            // so that becomes the new "already live" baseline. Before the first
+            // apply there is no compile leg yet, and none is needed: the first one
+            // built seeds itself.
+            current.seedFromDisk();
         }
     }
 
@@ -454,6 +566,38 @@ final class TransactionEngine {
         String trimmed = line.strip();
         return trimmed.length() <= 160 ? trimmed
                 : trimmed.substring(0, 157) + "...";
+    }
+
+    /**
+     * What is left for the developer to do when the bytes are live but the page
+     * may not show it yet.
+     * <p>
+     * {@code onHotswap} refreshes what Flow owns - components and the route
+     * registry - and nothing else. A redefined formatter, mapper or plain helper
+     * is live and correct, and yet a Grid whose cells were rendered on the server
+     * and pushed once keeps showing the old strings until something re-renders
+     * them. **Measured**: a method-body change to such a class read as "the apply
+     * did not work", when what had actually happened is that nothing asked the
+     * view to render again. Reporting {@code Stable} with no further word is the
+     * same kind of over-claim as C7, one level out from the bytes.
+     * <p>
+     * Not escalated to a restart and not turned into a page reload: the change
+     * <em>is</em> live, a restart would be a worse answer than the truth, and a
+     * forced reload would throw away the no-reload property for a class that may
+     * render nothing at all.
+     */
+    private String visibilityAdvice(Map<String, String> fields) {
+        if (!"-".equals(fields.getOrDefault("ui", "-"))) {
+            return "";
+        }
+        if (parseInt(fields.get("redefined")) == 0) {
+            // Nothing was loaded to redefine, so nothing rendered from it either:
+            // the new bytes are simply what loads the first time it is used.
+            return "";
+        }
+        return "live, but no Vaadin component was redefined - anything already "
+                + "rendered keeps its old output until the view renders again "
+                + "(interact with it, or reload the page)";
     }
 
     /**
@@ -535,7 +679,17 @@ final class TransactionEngine {
         String seconds = String.format(java.util.Locale.ROOT, "%.2fs",
                 tx.totalMs / 1000.0);
         switch (tx.outcome) {
-        case NO_CHANGES -> lines.add("no changes");
+        case NO_CHANGES -> {
+            // The reason is only set when something was examined and found not to
+            // matter, which is the case a bare "no changes" reads wrongly.
+            lines.add("no changes"
+                    + (tx.reason.isEmpty() ? "" : "   (" + tx.reason + ")"));
+            // Only when there is something the reader has to know: with the app
+            // up, "no changes" is the whole answer.
+            if (app.state() != AppProcess.State.RUNNING) {
+                lines.add("  → " + tx.nextAction);
+            }
+        }
         case SUPERSEDED -> lines.add("Failed(superseded): " + tx.reason);
         case FAILED -> {
             // Name the phase that actually failed; "compiling" on a frontend
@@ -569,6 +723,11 @@ final class TransactionEngine {
                         + (tx.duplicates > 0 ? "; " + tx.duplicates
                                 + " duplicate class copy/copies also redefined"
                                 : ""));
+                // Only set when the page may still be showing the old output;
+                // silence here is the claim that there is nothing left to do.
+                if (!tx.nextAction.isEmpty()) {
+                    lines.add("  → " + tx.nextAction);
+                }
             } else {
                 lines.add("compiling → runtime → restarting → Stable   ("
                         + seconds + ")");

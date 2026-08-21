@@ -15,9 +15,11 @@ Claims below are marked **[measured]** (observed in the running app),
 
 ## The short version
 
-The RFC's spine holds and is now proven end to end: one daemon per project root,
+The RFC's spine holds and is now proven end to end: one daemon per application,
 one transaction in flight, terminal states only, CLI over local RPC. A method-body
 change reached the browser with no restart, in ~80 ms of runtime work. **[measured]**
+One application, but not one module: P7 puts every reactor module the application
+depends on in the same loop, decided by the classpath Maven emits. **[measured]**
 
 Six of the RFC's technical premises were wrong or stale against the 25.2.6 code
 (C1–C6). Two were load-bearing, and Phase 0 confirmed both:
@@ -394,7 +396,7 @@ token in `.vaadin/` over AF_UNIX: portable, and this is a Windows-primary team. 
 
 Phase 0 already uses `.vaadin/devloop.port` for discovery, which exercises the idea.
 
-### 2 · The daemon — Java, one per project root
+### 2 · The daemon — Java, one per application
 
 Owns the transaction state machine, the compiler, the app process, the RPC surface.
 
@@ -403,6 +405,18 @@ Use **`javax.tools.JavaCompiler` in-process** rather than shelling to Maven: no 
 contract — file, line, column, code, message, already structured. Phase 0's harness does this
 and it works as advertised. Resolve the classpath once via `dependency:build-classpath`, cache,
 invalidate on `pom.xml` mtime.
+
+**Amended in P7** (multi-module): the resolution is `-pl :<app> -am compile
+dependency:build-classpath` from the reactor root, with a *relative* `mdep.outputFile` so every
+module writes its own. Two corrections behind that. Maven's reactor reader substitutes a
+module's `target/classes` only when that module's `compile` phase ran in the same session, so
+the goal alone hands back whatever jar is installed — **measured**: `demo-app`'s cached
+classpath resolved its sibling `flow-devloop` to `~/.m2/.../flow-devloop-1.0-SNAPSHOT.jar`
+while `flow-devloop/target/classes` sat there unused, which made every edit in that module
+invisible with the redefine still reporting success. And `mdep.outputFile` defaults to
+`regenerateFile=false`, so an unchanged classpath is not rewritten and its mtime never moves:
+the mtime check therefore re-resolved on **every** apply after a pom edit — 172 times in this
+project's own daemon log. Cache invalidation is now a stamp over every pom in the reactor.
 
 ### 3 · The connector — a jar inside the app
 
@@ -659,6 +673,23 @@ tersely.
 column" task without polling, sleeping, or asking how to check state. Note this task escalates to
 a restart on stock JDK — the agent must handle that outcome gracefully.
 
+### P7 · Multi-module projects — **DONE**
+
+One reactor module is the application; every reactor module it depends on is a compile domain.
+`Reactor` finds the root by verification (an ancestor counts only if its `<modules>`, expanded,
+contains the application — the `<parent>` chain is useless here, `demo-app` being parented by
+Spring Boot while the root aggregates it), and `Launch` decides the loop from the *resolved
+classpath* rather than from poms: the only directory entries Maven emits are reactor modules'
+output directories, which accounts for profiles, dependency management and transitivity in one
+step. `Compile` groups a change-set by module and runs javac once per module with that module's
+own `-d` and classpath; the `REDEFINE` wire contract is unchanged, so the connector takes a
+`vaadin.devloop.classes` search path instead of one directory.
+
+*Measured:* an edit to a method body in a sibling module reaches an open page in 0.67 s
+(`compileMs=54`, `runtimeMs=201`), a sibling CSS edit pushes in place in 0.03 s, and a
+structural change in a sibling plus its call site in the application survives a restart —
+which is the proof that `target/classes` and not the installed jar is what the JVM loads.
+
 ### P6 · Deferred: IDE-led mode and MCP
 
 Both are additional clients of the same RPC contract. IDE-led uses JDI via `HotswapPusher` with
@@ -690,6 +721,12 @@ registration.
 | **Redefinition scope** | **measured** | 67% stock vs 92% JBR. No longer an unknown; it is now a product decision (below). On stock, every structural edit escalates — including the RFC's own example. |
 | **Contract sits on internal API** | open | `Hotswapper` and `VaadinHotswapper` are "For internal use only. May be renamed or removed", and C1 shows the package already moved once. C3's amendment adds that the strategy is not exposed at all. Needs a Flow-team agreement to stabilise and extend, or version-pinned adapters plus a compatibility matrix. |
 | **JBR availability** | **resolved for this machine** | `jbr-25.0.2` is installed and accepts `-XX:+AllowEnhancedClassRedefinition`. Remains a distribution question for users, not a technical one. |
+| **A pom edit that breaks the build silently** | **measured, fixed** | Removing a dependency a module's code still uses left `apply` reporting `Stable`: no `.java` file changed, so the mtime scan found nothing to compile, and Maven's own `compile` was **measured not to recompile on a dependency change** either - so the first sign was a `ClassNotFoundException` at app startup, or nothing at all until the next full build. `Compile` now remembers the classpath each module was last compiled against and recompiles that module *whole* when it moves, which is the only way the breakage becomes a diagnostic. Compared on membership rather than order, so only the module that actually lost something is rebuilt. |
+| **A pom edit the running app never saw** | **found, fixed** | Editing a pom re-resolved the classpath and then reported `no changes`, because the source scan is the change-set and a pom is not a source - leaving the app running dependencies the poms no longer describe, indefinitely. The transaction now compares the resolved classpath against the one the app was actually **launched** with, puts the difference in the change-set, and restarts (a JVM's class path is fixed for its lifetime, so a redefine cannot help and is skipped rather than attempted). A pom edit that does not move the classpath stays quiet, which is what keeps the restart meaningful. |
+| **A redefine Flow does not refresh** | **measured, reported** | `onHotswap` refreshes what Flow owns - components and the route registry - so a redefined formatter/mapper/helper is live while a Grid whose cells were rendered on the server and pushed once still shows the old strings. It reads as "the apply did not work"; measured identically for a plain class in the application module and in a library module, and contrasted against a view-class edit, which does refresh in place (`hotswapMs` 297 vs 48). The connector now reports `ui=` (which redefined classes Flow will act on) and `apply` says "live, but no Vaadin component was redefined" instead of a bare `Stable`. Not escalated to a restart and not turned into a forced reload: the change *is* live, and a reload would throw away the no-reload property for a class that may render nothing. |
+| **A sibling module's frontend contributions** | new, open | A library module that carries `@Route`, `@JsModule` or `@NpmPackage` changes the route registry or the bundle, and the escalation rules know about beans and entities, not about frontend contributions. Such an edit reports `hot-reload` while the bundle is stale. Needs a restart; detecting it is not built. |
+| **A partly-successful multi-module compile** | new, accepted | Groups run dependencies first, and the first failure ends the compile — so an upstream module's classes can be on disk while the transaction says `Failed`. They are still in the change-set, so the next successful apply makes them live; but a restart in between would load them without an apply ever having claimed them. |
+| **Windows command line vs the classpath** | **measured, fixed** | One module's classpath is 22.6 kB of the 32,767-character `CreateProcess` limit, and a reactor adds a module's entries at a time. The app is launched through a JVM `@argfile` now, which also removes every quoting question. |
 | **Bash-only on a Windows team** | open | The RFC specifies one Bash script; the primary dev machine is Windows 11. Ship a `.cmd` too, or state Git Bash as a requirement. |
 
 ---

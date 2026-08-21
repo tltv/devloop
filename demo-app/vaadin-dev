@@ -44,7 +44,9 @@ usage: vaadin-dev <command> [options]
                     diagnostic: push named classes at the running app and print
                     the raw reply, without apply's escalation policy
 
-The daemon starts automatically on first use and serves this application only.
+The daemon starts automatically on first use and serves this application only. When the
+application is one module of a Maven reactor, every reactor module it depends on is in the
+loop too: apply scans, compiles and hot-reloads those the same way. status names them.
 
   VAADIN_DEV_HOME          where the daemon's jars live (default: ./.vaadin)
   VAADIN_DEV_PROGRESS      auto (default: a moving phase line on stderr when it is
@@ -54,7 +56,12 @@ The daemon starts automatically on first use and serves this application only.
                            is forwarded on to the app), -Dvaadin.dev.idleSeconds=60
                            or -Dvaadin.dev.startSettleMillis=15000 (how long a
                            registered app is given to report a listening web
-                           server; only reached if it never logs one)
+                           server; only reached if it never logs one).
+                           Multi-module: -Dvaadin.dev.reactorRoot=<dir> when the
+                           reactor root is not an ancestor of the application,
+                           -Dvaadin.dev.modules=<dirs> to set the loop by hand
+                           ("." for this module alone), -Dvaadin.dev.maven=<path>
+                           to pick the Maven that resolves the classpath
 EOF
 }
 

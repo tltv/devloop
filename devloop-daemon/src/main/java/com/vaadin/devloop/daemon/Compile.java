@@ -15,19 +15,26 @@ import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Stream;
 
 /**
- * The compile leg: change detection plus an in-process compile.
+ * The compile leg: change detection plus an in-process compile, over every
+ * module in the edit loop.
  * <p>
  * Uses {@link JavaCompiler} rather than shelling out to Maven for two reasons.
  * It skips a JVM start per apply, and its {@link Diagnostic} objects already
  * carry file, line, column, code and message — so the agent-facing
  * {@code diagnostics[]} contract needs no parsing of compiler text output.
+ * <p>
+ * One instance covers all modules rather than one instance per module: the two
+ * fingerprint maps are keyed by absolute source path, which stays unique across
+ * modules, and a single instance is what keeps "the change-set" one list with one
+ * answer. What every module multiplies is the <em>paths</em>, so each of those is
+ * derived from the module that owns the file instead of from one fixed root.
  */
 final class Compile {
 
@@ -70,23 +77,57 @@ final class Compile {
         }
     }
 
+    /** A file and the module it belongs to, which is all a walk ever needs. */
+    private interface Visitor {
+        void accept(Reactor.Module module, Path file, Stamp stamp);
+    }
+
     /** Fingerprints of Java sources as of the last time they went live. */
     private final Map<Path, Stamp> applied = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Fingerprints as of the last browser notification, keyed by source path. */
     private final Map<Path, Stamp> notified = new java.util.concurrent.ConcurrentHashMap<>();
 
-    private final Path root;
-    private final Path sourceDir;
-    private final Path resourceDir;
-    private final Path classesDir;
+    /** The edit loop, application module first. */
+    private final List<Reactor.Module> modules;
 
-    Compile(Path root) {
-        this.root = root;
-        this.sourceDir = root.resolve("src").resolve("main").resolve("java");
-        this.resourceDir = root.resolve("src").resolve("main")
-                .resolve("resources");
-        this.classesDir = root.resolve("target").resolve("classes");
+    /**
+     * The compile classpath each module was last compiled against.
+     * <p>
+     * Seeded from the build as it stands when this instance is created, so the
+     * first pom edit after that is measurable. Without it a dependency removal is
+     * invisible to the compile leg: no {@code .java} file changes, so nothing is
+     * stale, so javac never runs and the error surfaces - if at all - as a
+     * {@code ClassNotFoundException} at runtime, or not until the next full Maven
+     * build. Maven's own {@code compile} does not fill the gap either; it was
+     * measured not to recompile on a dependency change here.
+     */
+    private final Map<String, String> compiledAgainst = new java.util.concurrent.ConcurrentHashMap<>();
+
+    Compile(Launch.Project project) {
+        this.modules = List.copyOf(project.modules());
+        for (Reactor.Module module : modules) {
+            compiledAgainst.put(module.artifactId(),
+                    Launch.membership(project.compileClasspath(module)));
+        }
+    }
+
+    List<Reactor.Module> modules() {
+        return modules;
+    }
+
+    /** The application module, which is the base every reported path is relative to. */
+    private Reactor.Module app() {
+        return modules.get(0);
+    }
+
+    /**
+     * The module a file belongs to. A linear scan: the loop holds a handful of
+     * modules, and this replaces every place that used to relativize against one
+     * fixed root and would now throw for a file in a sibling.
+     */
+    private Optional<Reactor.Module> moduleOf(Path file) {
+        return modules.stream().filter(module -> module.owns(file)).findFirst();
     }
 
     /**
@@ -109,8 +150,9 @@ final class Compile {
      */
     List<Path> staleResources() {
         List<Path> stale = new ArrayList<>();
-        forEachResource((source, stamp) -> {
-            if (!copyIsCurrent(source) || !stamp.equals(notified.get(source))) {
+        forEachResource((module, source, stamp) -> {
+            if (!copyIsCurrent(module, source)
+                    || !stamp.equals(notified.get(source))) {
                 stale.add(source);
             }
         });
@@ -128,11 +170,11 @@ final class Compile {
     /** Seeds the fingerprints, so an untouched project reports no changes. */
     void seedResources() {
         notified.clear();
-        forEachResource(notified::put);
+        forEachResource((module, source, stamp) -> notified.put(source, stamp));
     }
 
-    private boolean copyIsCurrent(Path source) {
-        Path target = classesDir.resolve(resourceDir.relativize(source).toString());
+    private boolean copyIsCurrent(Reactor.Module module, Path source) {
+        Path target = module.targetFor(source);
         try {
             return Files.isRegularFile(target) && Files.getLastModifiedTime(source)
                     .compareTo(Files.getLastModifiedTime(target)) <= 0;
@@ -152,15 +194,9 @@ final class Compile {
         }
     }
 
-    private void forEachResource(java.util.function.BiConsumer<Path, Stamp> action) {
-        if (!Files.isDirectory(resourceDir)) {
-            return;
-        }
-        try (Stream<Path> walk = Files.walk(resourceDir)) {
-            walk.filter(Files::isRegularFile).forEach(source -> stampOf(source)
-                    .ifPresent(stamp -> action.accept(source, stamp)));
-        } catch (IOException ignored) {
-            // An unreadable tree yields an empty change-set, not a failure.
+    private void forEachResource(Visitor action) {
+        for (Reactor.Module module : modules) {
+            walk(module, module.resourceDir(), path -> true, action);
         }
     }
 
@@ -168,8 +204,13 @@ final class Compile {
     List<Path> copyResources(List<Path> sources) throws IOException {
         List<Path> copied = new ArrayList<>();
         for (Path source : sources) {
-            Path target = classesDir
-                    .resolve(resourceDir.relativize(source).toString());
+            Optional<Reactor.Module> owner = moduleOf(source);
+            if (owner.isEmpty()) {
+                // Only reachable when a module has just left the loop; the next
+                // apply will not offer the file at all.
+                continue;
+            }
+            Path target = owner.get().targetFor(source);
             Files.createDirectories(target.getParent());
             Files.copy(source, target,
                     java.nio.file.StandardCopyOption.REPLACE_EXISTING);
@@ -180,7 +221,7 @@ final class Compile {
 
     /**
      * The change-set: sources that either need compiling, or are compiled but not
-     * yet live in the running JVM.
+     * yet live in the running JVM, across every module in the loop.
      * <p>
      * The artifact comparison alone is not enough. It is right that a source newer
      * than its {@code .class} needs work, and it survives a daemon restart without
@@ -198,18 +239,54 @@ final class Compile {
      */
     Changes stale() {
         List<Path> modified = new ArrayList<>();
-        forEachSource((source, stamp) -> {
+        forEachSource((module, source, stamp) -> {
             // Two questions again, and for the same reason as resources. The
             // artifact check answers "does this need compiling?"; it cannot
             // answer "is this live in the running JVM?" - an IDE building on save
             // makes the .class newer than the .java, and a pure artifact check
             // then reports "no changes" for an edit the JVM has never loaded.
-            if (isStale(source) || !stamp.equals(applied.get(source))) {
+            if (isStale(module, source) || !stamp.equals(applied.get(source))) {
                 modified.add(source);
             }
         });
         modified.sort(Comparator.naturalOrder());
         return new Changes(modified, List.of());
+    }
+
+    /**
+     * Every source of every module whose compile classpath has moved since it was
+     * last compiled - a dependency added or removed, in that module or in one it
+     * inherits from.
+     * <p>
+     * A whole module rather than a guess at which files care: a removed
+     * dependency breaks whichever file happened to import it, and there is no
+     * cheaper way to find out than to ask javac. This is the only path that
+     * recompiles files nothing has edited, and it runs only when a pom actually
+     * changed the classpath, which is rare enough to pay for.
+     */
+    List<Path> classpathForced(Launch.Project project) {
+        List<Path> forced = new ArrayList<>();
+        for (Reactor.Module module : modules) {
+            String previous = compiledAgainst.get(module.artifactId());
+            if (previous == null || previous.equals(
+                    Launch.membership(project.compileClasspath(module)))) {
+                continue;
+            }
+            walk(module, module.sourceDir(),
+                    path -> path.toString().endsWith(".java"),
+                    (owner, file, stamp) -> forced.add(file));
+        }
+        forced.sort(Comparator.naturalOrder());
+        return forced;
+    }
+
+    /** The modules {@link #classpathForced} is answering for, for one log line. */
+    List<String> classpathChangedModules(Launch.Project project) {
+        return modules.stream().filter(module -> {
+            String previous = compiledAgainst.get(module.artifactId());
+            return previous != null && !previous.equals(
+                    Launch.membership(project.compileClasspath(module)));
+        }).map(Reactor.Module::name).toList();
     }
 
     /** Records that these sources are now live in the running JVM. */
@@ -225,29 +302,34 @@ final class Compile {
      */
     void seedFromDisk() {
         applied.clear();
-        forEachSource(applied::put);
+        forEachSource((module, source, stamp) -> applied.put(source, stamp));
         seedResources();
     }
 
-    private void forEachSource(java.util.function.BiConsumer<Path, Stamp> action) {
-        if (!Files.isDirectory(sourceDir)) {
+    private void forEachSource(Visitor action) {
+        for (Reactor.Module module : modules) {
+            walk(module, module.sourceDir(),
+                    path -> path.toString().endsWith(".java"), action);
+        }
+    }
+
+    private void walk(Reactor.Module module, Path tree,
+            java.util.function.Predicate<Path> accept, Visitor action) {
+        if (!Files.isDirectory(tree)) {
             return;
         }
-        try (Stream<Path> walk = Files.walk(sourceDir)) {
-            walk.filter(path -> path.toString().endsWith(".java"))
-                    .forEach(source -> stampOf(source)
-                            .ifPresent(stamp -> action.accept(source, stamp)));
+        try (Stream<Path> walk = Files.walk(tree)) {
+            walk.filter(Files::isRegularFile).filter(accept)
+                    .forEach(file -> stampOf(file).ifPresent(
+                            stamp -> action.accept(module, file, stamp)));
         } catch (IOException ignored) {
             // An unreadable tree yields an empty change-set, not a failure.
         }
     }
 
-    private boolean isStale(Path source) {
+    private boolean isStale(Reactor.Module module, Path source) {
         try {
-            Path relative = sourceDir.relativize(source);
-            String className = relative.toString()
-                    .replaceAll("\\.java$", ".class");
-            Path artifact = classesDir.resolve(className);
+            Path artifact = module.artifactFor(source);
             if (!Files.isRegularFile(artifact)) {
                 return true;
             }
@@ -258,7 +340,22 @@ final class Compile {
         }
     }
 
-    Result compile(List<Path> sources, String classpath) {
+    /**
+     * Compiles a change-set, one javac invocation per module.
+     * <p>
+     * Grouped rather than compiled in one pass because javac takes a single
+     * {@code -d}: one shared output would write a library module's classes into
+     * the application's {@code target/classes}, where Maven would never look for
+     * them again and where the next {@code mvn} run would not delete them either.
+     * Each group also compiles against its own module's classpath, so a library
+     * cannot silently start depending on a type only the application declares.
+     * <p>
+     * Groups run with the application last, since every in-loop module is one of
+     * its dependencies, and the first failing group ends the compile: a
+     * downstream module's errors after an upstream failure are consequences, and
+     * reporting them would bury the one line that has to be fixed.
+     */
+    Result compile(List<Path> sources, Launch.Project project) {
         long started = System.nanoTime();
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) {
@@ -268,15 +365,53 @@ final class Compile {
                             Optional.empty())),
                     List.of(), 0);
         }
+
+        List<String> written = new ArrayList<>();
+        for (Map.Entry<Reactor.Module, List<Path>> group : groupByModule(sources)
+                .entrySet()) {
+            Result result = compileModule(compiler, group.getKey(),
+                    group.getValue(), project);
+            if (!result.success()) {
+                return new Result(false, result.errors(), List.of(),
+                        (System.nanoTime() - started) / 1_000_000);
+            }
+            written.addAll(result.writtenClasses());
+        }
+        return new Result(true, List.of(), written.stream().sorted().toList(),
+                (System.nanoTime() - started) / 1_000_000);
+    }
+
+    /** The change-set by module, dependencies before the application. */
+    private Map<Reactor.Module, List<Path>> groupByModule(List<Path> sources) {
+        Map<Reactor.Module, List<Path>> grouped = new LinkedHashMap<>();
+        for (Reactor.Module module : modules.subList(1, modules.size())) {
+            collect(grouped, module, sources);
+        }
+        collect(grouped, app(), sources);
+        return grouped;
+    }
+
+    private void collect(Map<Reactor.Module, List<Path>> into,
+            Reactor.Module module, List<Path> sources) {
+        List<Path> owned = sources.stream().filter(module::owns).toList();
+        if (!owned.isEmpty()) {
+            into.put(module, owned);
+        }
+    }
+
+    private Result compileModule(JavaCompiler compiler, Reactor.Module module,
+            List<Path> sources, Launch.Project project) {
+        long started = System.nanoTime();
         DiagnosticCollector<JavaFileObject> collected = new DiagnosticCollector<>();
         long before = System.currentTimeMillis();
         try (StandardJavaFileManager fm = compiler
                 .getStandardFileManager(collected, null, StandardCharsets.UTF_8)) {
             Iterable<? extends JavaFileObject> units = fm.getJavaFileObjectsFromFiles(
                     sources.stream().map(Path::toFile).toList());
-            List<String> options = List.of("-classpath", classpath, "-d",
-                    classesDir.toString(), "-proc:none", "-encoding", "UTF-8",
-                    "-nowarn");
+            List<String> options = List.of("-classpath",
+                    project.compileClasspath(module), "-d",
+                    module.classesDir().toString(), "-proc:none", "-encoding",
+                    "UTF-8", "-nowarn");
             boolean ok = compiler
                     .getTask(null, fm, collected, options, null, units).call();
             List<Message> errors = new ArrayList<>();
@@ -292,8 +427,15 @@ final class Compile {
                         Optional.empty()));
             }
             long millis = (System.nanoTime() - started) / 1_000_000;
-            List<String> written = ok ? classesWrittenSince(before) : List.of();
-            return new Result(ok, errors, written, millis);
+            List<String> classes = ok ? classesWrittenSince(module, before)
+                    : List.of();
+            if (ok) {
+                // Only on success: a failed compile has to stay forced, or the
+                // next apply would report the broken module as having no changes.
+                compiledAgainst.put(module.artifactId(),
+                        Launch.membership(project.compileClasspath(module)));
+            }
+            return new Result(ok, errors, classes, millis);
         } catch (IOException e) {
             return new Result(false, List.of(new Message("-", 0, 0, "io-error",
                     String.valueOf(e.getMessage()), Optional.empty())),
@@ -301,9 +443,22 @@ final class Compile {
         }
     }
 
+    /**
+     * The file a diagnostic points at. Bare file name for the application, whose
+     * output shape is documented, and prefixed with the module directory for
+     * anything else — "Task.java:12" in a project with five modules is not enough
+     * to open the file with.
+     */
     private Message toMessage(Diagnostic<? extends JavaFileObject> d) {
-        String file = d.getSource() == null ? "-"
-                : Path.of(d.getSource().getName()).getFileName().toString();
+        String file = "-";
+        if (d.getSource() != null) {
+            Path path = Path.of(d.getSource().getName());
+            file = path.getFileName().toString();
+            Optional<Reactor.Module> owner = moduleOf(path);
+            if (owner.isPresent() && !owner.get().equals(app())) {
+                file = owner.get().name() + "/" + file;
+            }
+        }
         String text = tidy(d.getMessage(null));
         return new Message(file, d.getLineNumber(), d.getColumnNumber(),
                 String.valueOf(d.getCode()), text, hintFor(d.getCode(), text));
@@ -353,7 +508,9 @@ final class Compile {
         };
     }
 
-    private List<String> classesWrittenSince(long epochMillis) {
+    private List<String> classesWrittenSince(Reactor.Module module,
+            long epochMillis) {
+        Path classesDir = module.classesDir();
         if (!Files.isDirectory(classesDir)) {
             return List.of();
         }
@@ -364,19 +521,25 @@ final class Compile {
                 } catch (IOException e) {
                     return false;
                 }
-            }).map(p -> classesDir.relativize(p).toString()
-                    .replace(File.separatorChar, '.')
-                    .replaceAll("\\.class$", "")).sorted().toList();
+            }).map(module::binaryNameOf).sorted().toList();
         } catch (IOException e) {
             return List.of();
         }
     }
 
-    Path sourceDir() {
-        return sourceDir;
-    }
-
+    /**
+     * How a changed file is named back to the caller: relative to the application
+     * module, so a sibling reads {@code ../shared/src/main/java/...}. One base,
+     * and it is the directory the CLI is run from, so a path an agent is handed is
+     * a path it can open. Absolute is the fallback for a module on another
+     * Windows drive, where relativizing is not possible at all.
+     */
     String relative(Path path) {
-        return root.relativize(path).toString().replace(File.separatorChar, '/');
+        try {
+            return app().dir().relativize(path).toString()
+                    .replace(File.separatorChar, '/');
+        } catch (IllegalArgumentException e) {
+            return path.toString().replace(File.separatorChar, '/');
+        }
     }
 }

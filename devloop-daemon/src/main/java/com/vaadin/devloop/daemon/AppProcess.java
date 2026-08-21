@@ -140,6 +140,29 @@ final class AppProcess {
      * Either gate losing the race to the process exiting is a failure, reported
      * with the reason from the app's own log instead of a bare exit code.
      */
+    /**
+     * The same command, with everything after the java binary moved into a JVM
+     * argument file.
+     * <p>
+     * Not a nicety: one module's classpath is already 22 kB of Windows'
+     * 32,767-character process-creation limit, and a reactor adds a module's worth
+     * of entries at a time, so the direct command line is one shared library away
+     * from {@code CreateProcess error=206}. The argument file has no such limit,
+     * and it takes quoting out of the picture as well - within it, every argument
+     * is one quoted line, and a backslash only escapes what it is doubled onto.
+     */
+    private List<String> viaArgFile(List<String> command) throws IOException {
+        Path file = Launch.workDir(root).resolve("jvm-args.txt");
+        Files.createDirectories(file.getParent());
+        StringBuilder sb = new StringBuilder();
+        for (String argument : command.subList(1, command.size())) {
+            sb.append('"').append(argument.replace("\\", "\\\\")
+                    .replace("\"", "\\\"")).append('"').append('\n');
+        }
+        Files.writeString(file, sb.toString());
+        return List.of(command.get(0), "@" + file);
+    }
+
     synchronized Startup start(Launch.Log log) throws IOException {
         if (state == State.RUNNING || state == State.STARTING) {
             return Startup.ok(state == State.STARTING ? "already starting"
@@ -168,8 +191,8 @@ final class AppProcess {
                 .collect(java.util.stream.Collectors.joining(" "));
         log.line("flags: " + flags);
 
-        Process started = new ProcessBuilder(command).directory(root.toFile())
-                .redirectErrorStream(true)
+        Process started = new ProcessBuilder(viaArgFile(command))
+                .directory(root.toFile()).redirectErrorStream(true)
                 .redirectOutput(ProcessBuilder.Redirect.to(appLog.toFile()))
                 .start();
         this.process = started;

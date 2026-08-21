@@ -21,8 +21,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * The dev-loop daemon: one per project root, discovered through
+ * The dev-loop daemon: one per application module, discovered through
  * {@code .vaadin/daemon.properties}, never started by hand.
+ * <p>
+ * One application, which is not the same as one module: when the application sits
+ * in a Maven reactor, every reactor module it depends on is in the same edit loop.
+ * The application module is still the only tree the daemon owns — the handshake,
+ * the logs and the caches all live under it.
  * <p>
  * P1 scope is lifecycle only - {@code status}, {@code start}, {@code stop},
  * {@code restart}, {@code shutdown}. The transaction verbs come in P2/P3, which
@@ -46,6 +51,8 @@ public final class Daemon {
     }
 
     private final Path root;
+    private final Reactor reactor;
+    private final Launch launch;
     private final AppProcess app;
     private final Instant startedAt = Instant.now();
     private final AtomicInteger liveClients = new AtomicInteger();
@@ -60,9 +67,10 @@ public final class Daemon {
 
     private Daemon(Path root) {
         this.root = root;
-        Launch launch = new Launch(root, System.out::println);
+        this.reactor = Reactor.discover(root, System.out::println);
+        this.launch = new Launch(reactor, System.out::println);
         this.app = new AppProcess(root, launch);
-        this.transactions = new TransactionEngine(root, launch, app);
+        this.transactions = new TransactionEngine(launch, app);
     }
 
     public static void main(String[] args) throws Exception {
@@ -105,6 +113,13 @@ public final class Daemon {
 
         System.out.println("vaadin-dev daemon " + VERSION + " listening on "
                 + currentPort + " for " + root);
+        // The loop's shape, said out loud. Which modules an apply watches is the
+        // one thing a developer cannot infer from behaviour until an edit fails
+        // to be noticed, and by then they are debugging the wrong thing.
+        if (reactor.isMultiModule()) {
+            System.out.println("reactor " + reactor.root() + " - "
+                    + reactor.describe());
+        }
 
         while (!shuttingDown) {
             try {
@@ -306,6 +321,9 @@ public final class Daemon {
         }
         List<String> lines = new java.util.ArrayList<>();
         lines.add(sb.toString());
+        modulesLine().ifPresent(lines::add);
+        launch.resolutionError()
+                .ifPresent(reason -> lines.add("classpath: " + reason));
         app.failureReason().ifPresent(reason -> lines.add(reason));
         frontendStatus().ifPresent(f -> lines.add("frontend " + f));
         // Errors the app has logged since the last apply. This is where a failure
@@ -328,6 +346,41 @@ public final class Daemon {
                 + currentPort + " up="
                 + Duration.between(startedAt, Instant.now()).toSeconds() + "s");
         return lines;
+    }
+
+    /**
+     * The edit loop as far as it is known, and what is deliberately outside it.
+     * <p>
+     * Read from what has already been resolved, never by resolving: {@code status}
+     * answers in milliseconds and must not start a Maven build to do it. A
+     * single-module project says nothing, because there is nothing to say.
+     */
+    private Optional<String> modulesLine() {
+        if (!reactor.isMultiModule()) {
+            return Optional.empty();
+        }
+        Optional<Launch.Project> resolved = launch.resolved();
+        if (resolved.isEmpty()) {
+            return Optional.of("reactor " + reactor.describe()
+                    + "; the edit loop is resolved on the first apply or start");
+        }
+        List<String> loop = moduleNames(resolved.get().modules());
+        List<String> excluded = excludedModules(loop);
+        return Optional.of("modules " + String.join(", ", loop)
+                + (excluded.isEmpty() ? ""
+                        : "  (outside the loop: " + String.join(", ", excluded)
+                                + " - the app does not depend on "
+                                + (excluded.size() == 1 ? "it" : "them")
+                                + ")"));
+    }
+
+    private List<String> moduleNames(List<Reactor.Module> modules) {
+        return modules.stream().map(Reactor.Module::name).toList();
+    }
+
+    private List<String> excludedModules(List<String> loop) {
+        return reactor.candidates().stream().map(Reactor.Module::name)
+                .filter(name -> !loop.contains(name)).distinct().toList();
     }
 
     /**
@@ -365,7 +418,7 @@ public final class Daemon {
                 + ",\"mode\":\"" + app.mode() + "\",\"frontend\":\""
                 + Json.escape(frontendStatus().orElse("unknown"))
                 + "\",\"logErrors\":" + Json.strings(appLogErrors())
-                + "},\"daemon\":{\"pid\":"
+                + "},\"modules\":" + modulesJson() + ",\"daemon\":{\"pid\":"
                 + ProcessHandle.current().pid() + ",\"port\":" + currentPort
                 + ",\"version\":\"" + VERSION + "\",\"uptimeSeconds\":"
                 + Duration.between(startedAt, Instant.now()).toSeconds()
@@ -378,6 +431,23 @@ public final class Daemon {
                         .orElse("null")
                 + "}}";
         return List.of(json);
+    }
+
+    /**
+     * The loop in machine-readable form. {@code loop} is empty until something has
+     * resolved it, which is itself the answer to "why did my edit not count?".
+     */
+    private String modulesJson() {
+        List<String> loop = launch.resolved()
+                .map(project -> moduleNames(project.modules()))
+                .orElse(List.of());
+        // Nothing resolved means nothing is known to be excluded either; saying
+        // every module is out would be a claim the daemon has not made.
+        List<String> excluded = loop.isEmpty() ? List.of()
+                : excludedModules(loop);
+        return "{\"reactorRoot\":\"" + Json.escape(reactor.root().toString())
+                + "\",\"loop\":" + Json.strings(loop) + ",\"excluded\":"
+                + Json.strings(excluded) + "}";
     }
 
     private boolean tokenMatches(String candidate) {

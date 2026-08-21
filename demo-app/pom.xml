@@ -25,6 +25,7 @@
         <java.version>25</java.version>
         <vaadin.version>25.2.6</vaadin.version>
         <flow-devloop.version>1.0-SNAPSHOT</flow-devloop.version>
+        <demo-shared.version>1.0-SNAPSHOT</demo-shared.version>
     </properties>
 
     <dependencyManagement>
@@ -65,6 +66,17 @@
         <dependency>
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
+        </dependency>
+
+        <!-- A sibling module in the same reactor, depended on like any library.
+             This is what makes the application a multi-module one: an edit in
+             demo-shared has to reach the running app, which needs the daemon to
+             compile that module and the JVM to load its classes from its own
+             target/classes rather than from an installed jar. -->
+        <dependency>
+            <groupId>com.dev.vaadin.example</groupId>
+            <artifactId>demo-shared</artifactId>
+            <version>${demo-shared.version}</version>
         </dependency>
 
         <!-- The dev-loop connector, declared like any other dependency: this is how

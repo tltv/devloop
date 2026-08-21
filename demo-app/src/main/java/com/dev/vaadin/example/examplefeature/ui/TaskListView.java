@@ -3,9 +3,13 @@ package com.dev.vaadin.example.examplefeature.ui;
 import com.dev.vaadin.example.base.ui.ViewTitle;
 import com.dev.vaadin.example.examplefeature.Task;
 import com.dev.vaadin.example.examplefeature.TaskService;
+import com.dev.vaadin.example.shared.DueDateFormatter;
+import com.dev.vaadin.example.shared.Toolbar;
+
 import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.button.ButtonVariant;
 import com.vaadin.flow.component.datepicker.DatePicker;
+import com.vaadin.flow.component.dependency.StyleSheet;
 import com.vaadin.flow.component.grid.Grid;
 import com.vaadin.flow.component.notification.Notification;
 import com.vaadin.flow.component.notification.NotificationVariant;
@@ -19,12 +23,14 @@ import com.vaadin.flow.router.Route;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.FormatStyle;
-import java.util.Optional;
 
 import static com.vaadin.flow.spring.data.VaadinSpringDataHelpers.toSpringPageRequest;
 
 @Route(value = "")
 @PageTitle("Task List")
+// The stylesheet is in the demo-shared module, on the classpath like any other
+// resource - which is exactly what makes it a test of the cross-module CSS leg.
+@StyleSheet("task-list.css")
 @Menu(order = 0, icon = "icons/clipboard-check.svg", title = "Task List")
 class TaskListView extends VerticalLayout {
 
@@ -51,25 +57,24 @@ class TaskListView extends VerticalLayout {
         createBtn = new Button("Create", event -> createTask());
         createBtn.addThemeVariants(ButtonVariant.PRIMARY);
 
-        var toolbar = new HorizontalLayout();
+        var toolbar = new Toolbar();
         toolbar.add(new ViewTitle("Task List"), description, dueDate, createBtn);
         toolbar.setFlexGrow(1, description, dueDate);
-        toolbar.setWrap(true);
-        toolbar.setWidthFull();
 
         var dateTimeFormatter = DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM).withLocale(getLocale())
                 .withZone(ZoneId.systemDefault());
-        var dateFormatter = DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM).withLocale(getLocale());
+        var dueDateFormatter = new DueDateFormatter(getLocale());
 
         taskGrid = new Grid<>();
         taskGrid.setItems(query -> taskService.list(toSpringPageRequest(query)).stream());
         taskGrid.addColumn(Task::getDescription).setHeader("Description");
-        taskGrid.addColumn(task -> Optional.ofNullable(task.getDueDate()).map(dateFormatter::format).orElse("Never"))
+        taskGrid.addColumn(task -> dueDateFormatter.format(task.getDueDate()))
                 .setHeader("Due Date");
         taskGrid.addColumn(task -> dateTimeFormatter.format(task.getCreationDate())).setHeader("Creation Date");
         taskGrid.setEmptyStateText("You have no tasks to complete");
         taskGrid.setSizeFull();
 
+        addClassName("task-list-view");
         setSizeFull();
         add(toolbar, taskGrid);
     }

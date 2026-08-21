@@ -23,10 +23,11 @@
 
     <!-- demo-app is aggregated but not inherited from; Maven treats aggregation and
          inheritance separately, so one command still builds everything. Order
-         matters: demo-app resolves flow-devloop. -->
+         matters: demo-app resolves flow-devloop and demo-shared. -->
     <modules>
         <module>flow-devloop</module>
         <module>devloop-daemon</module>
+        <module>demo-shared</module>
         <module>demo-app</module>
     </modules>
 

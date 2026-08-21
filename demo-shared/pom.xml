@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.dev.vaadin.example</groupId>
+        <artifactId>dev-vaadin-example-root</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>demo-shared</artifactId>
+    <name>Demo shared library</name>
+    <description>
+        A library module the demo application depends on, standing in for the domain
+        or service module a real multi-module project keeps beside its application.
+        It exists to be edited: it carries Java the running UI renders and a
+        stylesheet the running page loads, so an apply into a sibling module can be
+        verified in the browser rather than only in the daemon's own report.
+
+        Deliberately dependency-free - not even Vaadin. What is being tested is that
+        the dev loop reaches another module at all, and a plain jar is the shape
+        that proves it for every project rather than only for Vaadin ones.
+    </description>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.vaadin</groupId>
+            <artifactId>vaadin-core-components</artifactId>
+        </dependency>
+    </dependencies>
+
+</project>
