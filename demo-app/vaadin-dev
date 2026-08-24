@@ -16,6 +16,17 @@ set -uo pipefail
 # every Vaadin application in a reactor rather than only the one beside it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# SCRIPT_APP is the application this copy of the script belongs to. A script staged
+# into the application's own .vaadin/ - the way a shipped version provisions it,
+# beside the daemon jars - belongs to the module above it, not to .vaadin itself,
+# which is a directory of build artifacts and never an application. Anywhere else,
+# the script sits in the application directory and that is the answer.
+if [[ "$(basename "$SCRIPT_DIR")" == ".vaadin" ]]; then
+    SCRIPT_APP="$(dirname "$SCRIPT_DIR")"
+else
+    SCRIPT_APP="$SCRIPT_DIR"
+fi
+
 # --app is consumed here, before anything derives a path from ROOT, and is stripped
 # from the arguments so the daemon never sees it. Accepted anywhere in the command
 # line: "vaadin-dev --app ../admin apply" and "vaadin-dev apply --app ../admin"
@@ -49,11 +60,11 @@ if [[ -n "$app_override" ]]; then
     fi
     # An override is the one case where the subject of the answer is not obvious
     # from where the script sits, so the answer says which application it is for.
-    if [[ "$ROOT" != "$SCRIPT_DIR" ]]; then
+    if [[ "$ROOT" != "$SCRIPT_APP" ]]; then
         echo "vaadin-dev: application $ROOT" >&2
     fi
 else
-    ROOT="$SCRIPT_DIR"
+    ROOT="$SCRIPT_APP"
 fi
 
 # Everything the daemon touches for this application - sources, target/, .vaadin/,
@@ -67,10 +78,10 @@ DAEMON_LOG="$ROOT/target/devloop/daemon.log"
 # Where the daemon's own jars come from. In a shipped version these would be
 # provisioned into .vaadin/ the way HotswapAgent already is; in this prototype they
 # are built from the sibling module when that is present.
-DAEMON_HOME="${VAADIN_DEV_HOME:-$SCRIPT_DIR/.vaadin}"
+DAEMON_HOME="${VAADIN_DEV_HOME:-$SCRIPT_APP/.vaadin}"
 DAEMON_JAR="$DAEMON_HOME/devloop-daemon.jar"
 AGENT_JAR="$DAEMON_HOME/devloop-daemon-agent.jar"
-DAEMON_MODULE="$SCRIPT_DIR/../devloop-daemon"
+DAEMON_MODULE="$SCRIPT_APP/../devloop-daemon"
 
 usage() {
     cat <<'EOF'
@@ -96,13 +107,16 @@ application is one module of a Maven reactor, every reactor module it depends on
 loop too: apply scans, compiles and hot-reloads those the same way. status names them.
 
   --app <dir>              the application to act on (default: the directory this
-                           script is in). One daemon, one .vaadin/ and one
+                           script is in, or the one above it when the script is
+                           staged in an application's .vaadin/). One daemon, one
+                           .vaadin/ and one
                            target/devloop/ per application, so a reactor holding
                            several Vaadin applications is driven by this one
                            script:  vaadin-dev --app ../admin apply
   VAADIN_DEV_APP           the same, as an environment variable; --app wins
-  VAADIN_DEV_HOME          where the daemon's jars live (default: the .vaadin next
-                           to this script, shared by every application it serves)
+  VAADIN_DEV_HOME          where the daemon's jars live (default: the .vaadin of
+                           the application this script belongs to, shared by every
+                           application it serves)
   VAADIN_DEV_PROGRESS      auto (default: a moving phase line on stderr when it is
                            a terminal), never, or always
   VAADIN_DEV_DAEMON_OPTS   JVM options for the daemon, e.g.
@@ -246,7 +260,7 @@ build_daemon_if_needed() {
     # Only the daemon module: it has no dependencies, so this stays quick and never
     # drags the app's frontend build in. Run from here so the wrapper finds .mvn,
     # and point it at the aggregator that owns the module.
-    ( cd "$SCRIPT_DIR" && ./mvnw -q -o -f ../pom.xml -pl devloop-daemon package -DskipTests ) >&2 \
+    ( cd "$SCRIPT_APP" && ./mvnw -q -o -f ../pom.xml -pl devloop-daemon package -DskipTests ) >&2 \
         || { echo "vaadin-dev: could not build devloop-daemon" >&2; exit 70; }
 
     mkdir -p "$DAEMON_HOME"
