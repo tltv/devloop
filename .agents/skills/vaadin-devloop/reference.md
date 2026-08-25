@@ -53,18 +53,26 @@ the app turns up.
 | Java or CSS in a sibling library module | same as the application's — `changeSet` shows it as `../<module>/...` |
 | A `pom.xml` anywhere in the reactor | the next `apply` re-resolves through Maven (a few seconds), then **recompiles whole** every module whose compile classpath moved — so removing a dependency the code still uses `Failed`s with real diagnostics instead of breaking at runtime. If the **app's** classpath moved (a dependency added or removed) it also **restarts** and names what moved. A pom edit that changes neither stays `no changes`. A pom that does not resolve fails the apply and names the artifact |
 
-## Verifying with Playwright
+## Verifying in the browser
+
+Use whatever browser automation this agent has — a Playwright/browser MCP server, a
+built-in browser tool, or a headless Playwright/Selenium script. The rules are the same
+whichever it is:
 
 - **Navigate once, keep the page open across applies.** CSS pushes and Java hot-swaps land in
   an already-open page; re-navigating hides what you are testing. Reload only after a restart.
-- **The first snapshot after `browser_navigate` is usually empty** — Vaadin renders
-  client-side. Wait for a known element or re-snapshot before asserting.
+- **The first snapshot after navigating is usually empty** — Vaadin renders client-side. Wait
+  for a known element or re-snapshot before asserting.
 - **CSS: assert computed style**, not screenshots —
-  `() => getComputedStyle(document.querySelector('.app-name')).fontSize`
+  `getComputedStyle(document.querySelector('.app-name')).fontSize`
 - **Java: assert the rendered DOM** — component text is in the light DOM:
-  `() => [...document.querySelectorAll('vaadin-button')].map(b => b.textContent.trim())`
-- Check `browser_console_messages` after a change (a `/favicon.ico` 404 is normal noise).
+  `[...document.querySelectorAll('vaadin-button')].map(b => b.textContent.trim())`
+- Read the browser console after a change (a `/favicon.ico` 404 is normal noise).
 - Dev mode injects Vaadin's dev-tools/Copilot toolbar — ignore those nodes, never assert on them.
+
+With no browser at hand, `curl http://localhost:8080` only proves the app serves the shell —
+say so rather than reporting the UI as verified, and fall back to `./mvnw test` for the parts a
+test can cover.
 
 ## When it goes wrong
 
@@ -72,13 +80,15 @@ the app turns up.
 - `frontend-down` — Vite stopped answering: `restart`.
 - App failed to start (a taken port, a bad config) → `start` exits `1` and names the reason
   from the app's own log, with the tail printed under it; `status` repeats the reason. The
-  whole log is `target/devloop/app.log`. Daemon wedged → `shutdown`, then any
-  command respawns it.
+  whole log is the target application's `target/devloop/app.log`. Daemon wedged → `shutdown`,
+  then any command respawns it.
 
 ## Environment
 
 ```
-VAADIN_DEV_HOME          where the daemon's jars live (default: the application’s .vaadin/)
+VAADIN_DEV_HOME          where the daemon's jars live (default: the .vaadin/ of the
+                         application the script belongs to, shared by every application it serves)
+VAADIN_DEV_APP           the application to act on; the --app option wins over it
 VAADIN_DEV_PROGRESS      auto (default) | never | always
 VAADIN_DEV_DAEMON_OPTS   JVM options for the daemon, e.g. -Dvaadin.frontend.hotdeploy=true,
                          -Dvaadin.dev.idleSeconds=60, -Dvaadin.dev.reactorRoot=<dir>,
@@ -89,8 +99,9 @@ VAADIN_DEV_DAEMON_OPTS   JVM options for the daemon, e.g. -Dvaadin.frontend.hotd
 
 ## Also
 
-- `./mvnw test` for unit + UI tests.
-- Use the **Vaadin MCP server** (`search_vaadin_docs`, `get_component_java_api`,
-  `get_component_styling`, `get_theme_css_properties`) instead of recalling API from memory;
-  check the Vaadin version in the application’s `pom.xml`. Prefer theme CSS properties (`--vaadin-*`,
-  `--aura-*`) over hard-coded values.
+- The target application's `./mvnw test` for unit + UI tests.
+- If a **Vaadin MCP server** is available (`search_vaadin_docs`, `get_component_java_api`,
+  `get_component_styling`, `get_theme_css_properties`), use it instead of recalling API from
+  memory; otherwise check the Vaadin version in the application's `pom.xml` and read
+  vaadin.com/docs for that version. Prefer theme CSS properties (`--vaadin-*`, `--aura-*`)
+  over hard-coded values.
