@@ -1,0 +1,8 @@
+[mcp_servers.vaadin]
+url = "https://mcp.vaadin.com/docs"
+enabled = true
+
+[mcp_servers.playwright]
+command = "npx"
+args = ["@playwright/mcp@0.0.73"]
+enabled = true
