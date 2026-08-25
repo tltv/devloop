@@ -35,6 +35,8 @@ how a single copy of the script drives another Vaadin application in the same re
 ./vaadin-dev stop | shutdown   stop the app / stop the daemon too
 ```
 
+`vaadin-dev` is a Bash script. **Always invoke it explicitly through Bash.** Never invoke it as `.\vaadin-dev`.
+ 
 **Never start the application through Maven** (`spring-boot:run`, `jetty:run`, an IDE run
 configuration): the daemon owns the app, and a second process fights it for the HTTP port. The
 daemon auto-spawns on first use and survives between commands, so every command — from any
