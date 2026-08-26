@@ -36,8 +36,8 @@ final class Launch {
             .toLowerCase(Locale.ROOT).startsWith("windows");
 
     /** Pinned, never "latest": a changing agent would make applies irreproducible. */
-    static final String HA_VERSION = "2.0.1";
-    static final String HA_SHA256 = "ba8d5e0571dc7952f2455f09d9ef6ca96782c17bc3d12f61eb3a5760f2a897f1";
+    static final String HA_VERSION = "2.0.3";
+    static final String HA_SHA256 = "4ef49724b7d8523536d2e2a7310f827f4db9f4fed3489224e05d7bf87f0594f9";
     static final String HA_URL = "https://github.com/HotswapProjects/HotswapAgent/releases/download/RELEASE-"
             + HA_VERSION + "/hotswap-agent-" + HA_VERSION + ".jar";
 
@@ -957,8 +957,9 @@ final class Launch {
         if (supportsEnhancedRedefinition(java)) {
             cmd.add("-XX:+AllowEnhancedClassRedefinition");
         }
-        // Vaadin: its plugin targets the 24.x package and would fire a second,
-        // competing browser refresh.
+        // Vaadin: since HotswapAgent 2.0.3 its plugin handles 25.1 too, so it
+        // now works rather than no-ops - and would fire a second, competing
+        // browser refresh on top of Flow's soft refresh. Still disabled.
         // Spring/SpringBoot: measured to corrupt the context under repeated
         // redefinitions on this stack - HA's scanner loses the Spring Data
         // repository bean ("basePackage not associated with any scannerAgent"),
